@@ -29,6 +29,7 @@ import com.google.common.collect.Lists;
 import org.apache.lucene.store.StoreRateLimiting;
 import org.apache.lucene.util.AbstractRandomizedTest;
 import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.util.TestUtil;
 import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.Version;
@@ -74,6 +75,7 @@ import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.common.util.concurrent.EsRejectedExecutionException;
 import org.elasticsearch.common.xcontent.XContentBuilder;
 import org.elasticsearch.common.xcontent.XContentFactory;
+import org.elasticsearch.common.xcontent.XContentHelper;
 import org.elasticsearch.common.xcontent.support.XContentMapValues;
 import org.elasticsearch.discovery.zen.elect.ElectMasterService;
 import org.elasticsearch.index.codec.CodecService;
@@ -107,6 +109,8 @@ import org.elasticsearch.test.disruption.ServiceDisruptionScheme;
 import org.hamcrest.Matchers;
 import org.junit.*;
 
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.lang.annotation.ElementType;
 import java.lang.annotation.Retention;
@@ -407,6 +411,7 @@ public abstract class ElasticsearchIntegrationTest extends ElasticsearchTestCase
                     .setOrder(0)
                     .setSettings(randomSettingsBuilder);
             if (mappings != null) {
+                logger.info("test using _default_ mappings: [{}]", mappings.bytesStream().bytes().toUtf8());
                 putTemplate.addMapping("_default_", mappings);
             }
             assertAcked(putTemplate.execute().actionGet());
@@ -1071,6 +1076,13 @@ public abstract class ElasticsearchIntegrationTest extends ElasticsearchTestCase
         logger.debug("cluster state:\n{}\n{}", client().admin().cluster().prepareState().get().getState().prettyPrint(), client().admin().cluster().preparePendingClusterTasks().get().prettyPrint());
     }
 
+    /**
+     * Prints current memory stats as info logging.
+     */
+    public void logMemoryStats() {
+        logger.info("memory: {}", XContentHelper.toString(client().admin().cluster().prepareNodesStats().clear().setJvm(true).get()));
+    }
+    
     void ensureClusterSizeConsistency() {
         if (cluster() != null) { // if static init fails the cluster can be null
             logger.trace("Check consistency for [{}] nodes", cluster().size());
@@ -1694,11 +1706,10 @@ public abstract class ElasticsearchIntegrationTest extends ElasticsearchTestCase
     }
 
     /**
-     * Returns a random numeric field data format from the choices of "array",
-     * "compressed", or "doc_values".
+     * Returns a random numeric field data format from the choices of "array" or "doc_values".
      */
     public static String randomNumericFieldDataFormat() {
-        return randomFrom(Arrays.asList("array", "compressed", "doc_values"));
+        return randomFrom(Arrays.asList("array", "doc_values"));
     }
 
     /**
@@ -1790,6 +1801,36 @@ public abstract class ElasticsearchIntegrationTest extends ElasticsearchTestCase
         } else {
             INSTANCE = null;
         }
+    }
+
+    /**
+     * Return settings that could be used to start a node that has the given zipped home directory.
+     */
+    protected Settings prepareBackwardsDataDir(File backwardsIndex, Object... settings) throws IOException {
+        File indexDir = newTempDir();
+        File dataDir = new File(indexDir, "data");
+        TestUtil.unzip(backwardsIndex, indexDir);
+        assertTrue(dataDir.exists());
+        String[] list = dataDir.list();
+        if (list == null || list.length > 1) {
+            throw new IllegalStateException("Backwards index must contain exactly one cluster");
+        }
+        File src = new File(dataDir, list[0]);
+        File dest = new File(dataDir, internalCluster().getClusterName());
+        assertTrue(src.exists());
+        src.renameTo(dest);
+        assertFalse(src.exists());
+        assertTrue(dest.exists());
+        ImmutableSettings.Builder builder = ImmutableSettings.builder()
+            .put(settings)
+            .put("gateway.type", "local") // this is important we need to recover from gateway
+            .put("path.data", dataDir.getPath());
+
+        File configDir = new File(indexDir, "config");
+        if (configDir.exists()) {
+            builder.put("path.conf", configDir.getPath());
+        }
+        return builder.build();
     }
 
     /**

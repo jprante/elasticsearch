@@ -20,6 +20,7 @@
 package org.elasticsearch.index.mapper.timestamp;
 
 import org.elasticsearch.action.TimestampParsingException;
+import org.elasticsearch.action.admin.indices.delete.DeleteIndexRequest;
 import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.cluster.metadata.MappingMetaData;
 import org.elasticsearch.cluster.metadata.MetaData;
@@ -102,6 +103,8 @@ public class TimestampMappingTests extends ElasticsearchSingleNodeTest {
                 .startObject("_timestamp")
                 .field("enabled", "yes").field("store", "yes").field("index", "no")
                 .field("path", "timestamp").field("format", "year")
+                .field("doc_values", true)
+                .field("doc_values_format", "Lucene410")
                 .endObject()
                 .endObject().endObject().string();
         DocumentMapper docMapper = createIndex("test").mapperService().documentMapperParser().parse(mapping);
@@ -110,6 +113,8 @@ public class TimestampMappingTests extends ElasticsearchSingleNodeTest {
         assertThat(docMapper.timestampFieldMapper().fieldType().indexed(), equalTo(false));
         assertThat(docMapper.timestampFieldMapper().path(), equalTo("timestamp"));
         assertThat(docMapper.timestampFieldMapper().dateTimeFormatter().format(), equalTo("year"));
+        assertThat(docMapper.timestampFieldMapper().hasDocValues(), equalTo(true));
+        assertThat(docMapper.timestampFieldMapper().docValuesFormatProvider().name(), equalTo("Lucene410"));
     }
 
     @Test
@@ -416,10 +421,11 @@ public class TimestampMappingTests extends ElasticsearchSingleNodeTest {
     @Test
     public void testParsingNotDefaultTwiceDoesNotChangeMapping() throws Exception {
         String mapping = XContentFactory.jsonBuilder().startObject().startObject("type")
-                .startObject("_timestamp").field("enabled", true)
-                .field("index", randomBoolean() ? "no" : "analyzed") // default is "not_analyzed" which will be omitted when building the source again
-                .field("store", true)
-                .field("path", "foo")
+            .startObject("_timestamp").field("enabled", true)
+            .field("index", randomBoolean() ? "no" : "analyzed") // default is "not_analyzed" which will be omitted when building the source again
+            .field("store", true)
+            .field("doc_values", true)
+            .field("path", "foo")
                 .field("default", "1970-01-01")
                 .startObject("fielddata").field("format", "doc_values").endObject()
                 .endObject()
@@ -522,6 +528,105 @@ public class TimestampMappingTests extends ElasticsearchSingleNodeTest {
         for (String conflict : mergeResult.conflicts()) {
             assertThat(conflict, isIn(expectedConflicts));
         }
+    }
+
+    /**
+     * Test case for #9204
+     */
+    @Test
+    public void testMergingNullValues() throws Exception {
+        // From trying to add another field with default = null
+        String mapping = XContentFactory.jsonBuilder().startObject()
+                .startObject("type")
+                .startObject("_timestamp")
+                    .field("enabled", true)
+                    .field("default", (String) null)
+                .endObject()
+                .endObject().endObject().string();
+        DocumentMapperParser parser = createIndex("test").mapperService().documentMapperParser();
+
+        DocumentMapper docMapper = parser.parse(mapping);
+        mapping = XContentFactory.jsonBuilder().startObject()
+                .startObject("type")
+                    .startObject("_timestamp")
+                        .field("enabled", true)
+                        .field("default", (String) null)
+                    .endObject()
+                    .startObject("properties")
+                        .startObject("foo")
+                            .field("type", "string")
+                        .endObject()
+                    .endObject()
+                .endObject().endObject().string();
+
+        DocumentMapper.MergeResult mergeResult = docMapper.merge(parser.parse(mapping), DocumentMapper.MergeFlags.mergeFlags().simulate(true));
+        assertThat(mergeResult.hasConflicts(), is(false));
+
+        client().admin().indices().delete(new DeleteIndexRequest("test")).get();
+
+        // From trying to update from null to non null
+        mapping = XContentFactory.jsonBuilder().startObject()
+                .startObject("type")
+                .startObject("_timestamp")
+                    .field("enabled", true)
+                    .field("default", (String) null)
+                .endObject()
+                .endObject().endObject().string();
+        parser = createIndex("test").mapperService().documentMapperParser();
+
+        docMapper = parser.parse(mapping);
+        mapping = XContentFactory.jsonBuilder().startObject()
+                .startObject("type")
+                    .startObject("_timestamp")
+                        .field("enabled", true)
+                        .field("default", "now")
+                    .endObject()
+                .endObject().endObject().string();
+
+        mergeResult = docMapper.merge(parser.parse(mapping), DocumentMapper.MergeFlags.mergeFlags().simulate(true));
+        assertThat(mergeResult.hasConflicts(), is(true));
+
+        client().admin().indices().delete(new DeleteIndexRequest("test")).get();
+
+        // From trying to update from non null to null
+        mapping = XContentFactory.jsonBuilder().startObject()
+                .startObject("type")
+                .startObject("_timestamp")
+                    .field("enabled", true)
+                    .field("default", "now")
+                .endObject()
+                .endObject().endObject().string();
+        parser = createIndex("test").mapperService().documentMapperParser();
+
+        docMapper = parser.parse(mapping);
+        mapping = XContentFactory.jsonBuilder().startObject()
+                .startObject("type")
+                    .startObject("_timestamp")
+                .field("enabled", true)
+                .field("default", (String) null)
+                    .endObject()
+                .endObject().endObject().string();
+
+        mergeResult = docMapper.merge(parser.parse(mapping), DocumentMapper.MergeFlags.mergeFlags().simulate(true));
+        assertThat(mergeResult.hasConflicts(), is(true));
+    }
+
+    /**
+     * Test for issue #9223
+     */
+    @Test
+    public void testInitMappers() throws IOException {
+        String mapping = XContentFactory.jsonBuilder().startObject()
+                .startObject("type")
+                    .startObject("_timestamp")
+                        .field("enabled", true)
+                        .field("default", (String) null)
+                    .endObject()
+                .endObject().endObject().string();
+        // This was causing a NPE
+        MappingMetaData mappingMetaData = new MappingMetaData(new CompressedString(mapping));
+        String defaultTimestamp = mappingMetaData.timestamp().defaultTimestamp();
+        assertThat(defaultTimestamp, is(nullValue()));
     }
 
     @Test

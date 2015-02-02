@@ -23,6 +23,8 @@ import com.google.common.base.Predicate;
 import org.apache.log4j.AppenderSkeleton;
 import org.apache.log4j.Level;
 import org.apache.log4j.Logger;
+import org.apache.log4j.LogManager;
+
 import org.apache.log4j.spi.LoggingEvent;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.document.Field;
@@ -30,11 +32,13 @@ import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.document.TextField;
 import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.index.IndexDeletionPolicy;
-import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.TermQuery;
-import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.util.LuceneTestCase.Slow;
+import org.apache.lucene.index.*;
+import org.apache.lucene.search.MatchAllDocsQuery;
+import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.store.MockDirectoryWrapper;
 import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.Version;
 import org.elasticsearch.cluster.metadata.IndexMetaData;
@@ -54,6 +58,7 @@ import org.elasticsearch.index.deletionpolicy.SnapshotIndexCommit;
 import org.elasticsearch.index.engine.*;
 import org.elasticsearch.index.indexing.ShardIndexingService;
 import org.elasticsearch.index.indexing.slowlog.ShardSlowLogIndexingService;
+import org.elasticsearch.index.mapper.DocumentMapper;
 import org.elasticsearch.index.mapper.ParseContext.Document;
 import org.elasticsearch.index.mapper.ParsedDocument;
 import org.elasticsearch.index.mapper.internal.SourceFieldMapper;
@@ -106,6 +111,9 @@ public class InternalEngineTests extends ElasticsearchTestCase {
     private Store store;
     private Store storeReplica;
 
+    protected Translog translog;
+    protected Translog replicaTranslog;
+
     protected Engine engine;
     protected Engine replicaEngine;
 
@@ -130,13 +138,15 @@ public class InternalEngineTests extends ElasticsearchTestCase {
         storeReplica = createStoreReplica();
         storeReplica.deleteContent();
         engineSettingsService = new IndexSettingsService(shardId.index(), ImmutableSettings.builder().put(IndexMetaData.SETTING_VERSION_CREATED, Version.CURRENT).build());
-        engine = createEngine(engineSettingsService, store, createTranslog());
+        translog = createTranslog();
+        engine = createEngine(engineSettingsService, store, translog);
         if (randomBoolean()) {
             engine.enableGcDeletes(false);
         }
         engine.start();
         replicaSettingsService = new IndexSettingsService(shardId.index(), ImmutableSettings.builder().put(IndexMetaData.SETTING_VERSION_CREATED, Version.CURRENT).build());
-        replicaEngine = createEngine(replicaSettingsService, storeReplica, createTranslogReplica());
+        replicaTranslog = createTranslogReplica();
+        replicaEngine = createEngine(replicaSettingsService, storeReplica, replicaTranslog);
         if (randomBoolean()) {
             replicaEngine.enableGcDeletes(false);
         }
@@ -326,8 +336,9 @@ public class InternalEngineTests extends ElasticsearchTestCase {
         assertThat(segments.get(2).isCompound(), equalTo(true));
     }
 
-    public void testStartAndAcquireConcurrently() {
+    public void testStartAndAcquireConcurrently() throws Exception {
         ConcurrentMergeSchedulerProvider mergeSchedulerProvider = new ConcurrentMergeSchedulerProvider(shardId, EMPTY_SETTINGS, threadPool, new IndexSettingsService(shardId.index(), EMPTY_SETTINGS));
+        Store store = createStore();
         final Engine engine = createEngine(engineSettingsService, store, createTranslog(), mergeSchedulerProvider);
         final AtomicBoolean startPending = new AtomicBoolean(true);
         Thread thread = new Thread() {
@@ -351,11 +362,13 @@ public class InternalEngineTests extends ElasticsearchTestCase {
             }
         }
         engine.close();
+        store.close();
     }
 
 
     @Test
     public void testSegmentsWithMergeFlag() throws Exception {
+
         ConcurrentMergeSchedulerProvider mergeSchedulerProvider = new ConcurrentMergeSchedulerProvider(shardId, EMPTY_SETTINGS, threadPool, new IndexSettingsService(shardId.index(), EMPTY_SETTINGS));
         final AtomicReference<CountDownLatch> waitTillMerge = new AtomicReference<>();
         final AtomicReference<CountDownLatch> waitForMerge = new AtomicReference<>();
@@ -379,6 +392,7 @@ public class InternalEngineTests extends ElasticsearchTestCase {
             }
         });
 
+        final Store store = createStore();
         final Engine engine = createEngine(engineSettingsService, store, createTranslog(), mergeSchedulerProvider);
         engine.start();
         ParsedDocument doc = testParsedDocument("1", "1", "test", null, -1, -1, testDocument(), Lucene.STANDARD_ANALYZER, B_1, false);
@@ -449,6 +463,7 @@ public class InternalEngineTests extends ElasticsearchTestCase {
         }
 
         engine.close();
+        store.close();
     }
 
     @Test
@@ -703,7 +718,7 @@ public class InternalEngineTests extends ElasticsearchTestCase {
 
     @Test
     public void testSimpleRecover() throws Exception {
-        ParsedDocument doc = testParsedDocument("1", "1", "test", null, -1, -1, testDocumentWithTextField(), Lucene.STANDARD_ANALYZER, B_1, false);
+        final ParsedDocument doc = testParsedDocument("1", "1", "test", null, -1, -1, testDocumentWithTextField(), Lucene.STANDARD_ANALYZER, B_1, false);
         engine.create(new Engine.Create(null, newUid("1"), doc));
         engine.flush(new Engine.Flush());
 
@@ -727,11 +742,14 @@ public class InternalEngineTests extends ElasticsearchTestCase {
                 } catch (FlushNotAllowedEngineException e) {
                     // all is well
                 }
+
+                // but we can index
+                engine.index(new Engine.Index(null, newUid("1"), doc));
             }
 
             @Override
             public void phase3(Translog.Snapshot snapshot) throws EngineException {
-                MatcherAssert.assertThat(snapshot, TranslogSizeMatcher.translogSize(0));
+                MatcherAssert.assertThat(snapshot, TranslogSizeMatcher.translogSize(1));
                 try {
                     // we can do this here since we are on the same thread
                     engine.flush(new Engine.Flush());
@@ -741,6 +759,8 @@ public class InternalEngineTests extends ElasticsearchTestCase {
                 }
             }
         });
+        // post recovery should flush the translog
+        MatcherAssert.assertThat(translog.snapshot(), TranslogSizeMatcher.translogSize(0));
 
         engine.flush(new Engine.Flush());
         engine.close();
@@ -1228,27 +1248,30 @@ public class InternalEngineTests extends ElasticsearchTestCase {
     }
 
     private static class MockAppender extends AppenderSkeleton {
-      public boolean sawIndexWriterMessage;
+        public boolean sawIndexWriterMessage;
+        public boolean sawIndexWriterIFDMessage;
 
-      @Override
-      protected void append(LoggingEvent event) {
-        if (event.getLevel() == Level.TRACE &&
-            event.getLoggerName().endsWith("lucene.iw") &&
-            event.getMessage().toString().contains("IW: apply all deletes during flush") &&
-            event.getMessage().toString().contains("[index][1] ")) {
-
-          sawIndexWriterMessage = true;
+        @Override
+        protected void append(LoggingEvent event) {
+            if (event.getLevel() == Level.TRACE && event.getMessage().toString().contains("[index][1] ")) {
+                if (event.getLoggerName().endsWith("lucene.iw") &&
+                    event.getMessage().toString().contains("IW: apply all deletes during flush")) {
+                    sawIndexWriterMessage = true;
+                }
+                if (event.getLoggerName().endsWith("lucene.iw.ifd")) {
+                    sawIndexWriterIFDMessage = true;
+                }
+            }
         }
-      }
 
-      @Override
-      public boolean requiresLayout() {
-        return false;
-      }
+        @Override
+        public boolean requiresLayout() {
+            return false;
+        }
 
-      @Override
-      public void close() {
-      }
+        @Override
+        public void close() {
+        }
     }
 
     // #5891: make sure IndexWriter's infoStream output is
@@ -1282,6 +1305,42 @@ public class InternalEngineTests extends ElasticsearchTestCase {
         }
     }
 
+    // #8603: make sure we can separately log IFD's messages
+    public void testIndexWriterIFDInfoStream() {
+        MockAppender mockAppender = new MockAppender();
+
+        // Works when running this test inside Intellij:
+        Logger iwIFDLogger = LogManager.exists("org.elasticsearch.lucene.iw.ifd");
+        if (iwIFDLogger == null) {
+            // Works when running this test from command line:
+            iwIFDLogger = LogManager.exists("lucene.iw.ifd");
+            assertNotNull(iwIFDLogger);
+        }
+        Level savedLevel = iwIFDLogger.getLevel();
+        iwIFDLogger.addAppender(mockAppender);
+        iwIFDLogger.setLevel(Level.DEBUG);
+
+        try {
+            // First, with DEBUG, which should NOT log IndexWriter output:
+            ParsedDocument doc = testParsedDocument("1", "1", "test", null, -1, -1, testDocumentWithTextField(), Lucene.STANDARD_ANALYZER, B_1, false);
+            engine.create(new Engine.Create(null, newUid("1"), doc));
+            engine.flush(new Engine.Flush());        
+            assertFalse(mockAppender.sawIndexWriterMessage);
+            assertFalse(mockAppender.sawIndexWriterIFDMessage);
+
+            // Again, with TRACE, which should only log IndexWriter IFD output:
+            iwIFDLogger.setLevel(Level.TRACE);
+            engine.create(new Engine.Create(null, newUid("2"), doc));
+            engine.flush(new Engine.Flush());        
+            assertFalse(mockAppender.sawIndexWriterMessage);
+            assertTrue(mockAppender.sawIndexWriterIFDMessage);
+
+        } finally {
+            iwIFDLogger.removeAppender(mockAppender);
+            iwIFDLogger.setLevel(null);
+        }
+    }
+
     @Slow
     @Test
     public void testEnableGcDeletes() throws Exception {
@@ -1291,6 +1350,7 @@ public class InternalEngineTests extends ElasticsearchTestCase {
                 .put(InternalEngine.INDEX_GC_DELETES, "0ms")
                 .build();
 
+        Store store = createStore();
         Engine engine = new InternalEngine(shardId, settings, threadPool,
                                            engineSettingsService,
                                            new ShardIndexingService(shardId, settings,
@@ -1351,9 +1411,95 @@ public class InternalEngineTests extends ElasticsearchTestCase {
         // Get should not find the document
         getResult = engine.get(new Engine.Get(true, newUid("2")));
         assertThat(getResult.exists(), equalTo(false));
+        engine.close();
+        store.close();
     }
 
     protected Term newUid(String id) {
         return new Term("_uid", id);
     }
+
+    @Test
+    public void testRetryWithAutogeneratedIdWorksAndNoDuplicateDocs() throws IOException {
+
+        ParsedDocument doc = testParsedDocument("1", "1", "test", null, -1, -1, testDocument(), Lucene.STANDARD_ANALYZER, B_1, false);
+        boolean canHaveDuplicates = false;
+        boolean autoGeneratedId = true;
+
+        Engine.Create index = new Engine.Create(null, newUid("1"), doc, Versions.MATCH_ANY, VersionType.INTERNAL, PRIMARY, System.nanoTime(), canHaveDuplicates, autoGeneratedId);
+        engine.create(index);
+        assertThat(index.version(), equalTo(1l));
+
+        index = new Engine.Create(null, newUid("1"), doc, index.version(), index.versionType().versionTypeForReplicationAndRecovery(), REPLICA, System.nanoTime(), canHaveDuplicates, autoGeneratedId);
+        replicaEngine.create(index);
+        assertThat(index.version(), equalTo(1l));
+
+        canHaveDuplicates = true;
+        index = new Engine.Create(null, newUid("1"), doc, Versions.MATCH_ANY, VersionType.INTERNAL, PRIMARY, System.nanoTime(), canHaveDuplicates, autoGeneratedId);
+        engine.create(index);
+        assertThat(index.version(), equalTo(1l));
+        engine.refresh(new Engine.Refresh("test").force(true));
+        Engine.Searcher searcher = engine.acquireSearcher("test");
+        TopDocs topDocs = searcher.searcher().search(new MatchAllDocsQuery(), 10);
+        assertThat(topDocs.totalHits, equalTo(1));
+
+        index = new Engine.Create(null, newUid("1"), doc, index.version(), index.versionType().versionTypeForReplicationAndRecovery(), REPLICA, System.nanoTime(), canHaveDuplicates, autoGeneratedId);
+        try {
+            replicaEngine.create(index);
+            fail();
+        } catch (VersionConflictEngineException e) {
+            // we ignore version conflicts on replicas, see TransportShardReplicationOperationAction.ignoreReplicaException
+        }
+        replicaEngine.refresh(new Engine.Refresh("test").force(true));
+        Engine.Searcher replicaSearcher = replicaEngine.acquireSearcher("test");
+        topDocs = replicaSearcher.searcher().search(new MatchAllDocsQuery(), 10);
+        assertThat(topDocs.totalHits, equalTo(1));
+        searcher.close();
+        replicaSearcher.close();
+    }
+
+    @Test
+    public void testRetryWithAutogeneratedIdsAndWrongOrderWorksAndNoDuplicateDocs() throws IOException {
+
+        ParsedDocument doc = testParsedDocument("1", "1", "test", null, -1, -1, testDocument(), Lucene.STANDARD_ANALYZER, B_1, false);
+        boolean canHaveDuplicates = true;
+        boolean autoGeneratedId = true;
+
+        Engine.Create firstIndexRequest = new Engine.Create(null, newUid("1"), doc, Versions.MATCH_ANY, VersionType.INTERNAL, PRIMARY, System.nanoTime(), canHaveDuplicates, autoGeneratedId);
+        engine.create(firstIndexRequest);
+        assertThat(firstIndexRequest.version(), equalTo(1l));
+
+        Engine.Create firstIndexRequestReplica = new Engine.Create(null, newUid("1"), doc, firstIndexRequest.version(), firstIndexRequest.versionType().versionTypeForReplicationAndRecovery(), REPLICA, System.nanoTime(), canHaveDuplicates, autoGeneratedId);
+        replicaEngine.create(firstIndexRequestReplica);
+        assertThat(firstIndexRequestReplica.version(), equalTo(1l));
+
+        canHaveDuplicates = false;
+        Engine.Create secondIndexRequest = new Engine.Create(null, newUid("1"), doc, Versions.MATCH_ANY, VersionType.INTERNAL, PRIMARY, System.nanoTime(), canHaveDuplicates, autoGeneratedId);
+        try {
+            engine.create(secondIndexRequest);
+            fail();
+        } catch (DocumentAlreadyExistsException e) {
+            // we can ignore the exception. In case this happens because the retry request arrived first then this error will not be sent back anyway.
+            // in any other case this is an actual error
+        }
+        engine.refresh(new Engine.Refresh("test").force(true));
+        Engine.Searcher searcher = engine.acquireSearcher("test");
+        TopDocs topDocs = searcher.searcher().search(new MatchAllDocsQuery(), 10);
+        assertThat(topDocs.totalHits, equalTo(1));
+
+        Engine.Create secondIndexRequestReplica = new Engine.Create(null, newUid("1"), doc, firstIndexRequest.version(), firstIndexRequest.versionType().versionTypeForReplicationAndRecovery(), REPLICA, System.nanoTime(), canHaveDuplicates, autoGeneratedId);
+        try {
+            replicaEngine.create(secondIndexRequestReplica);
+            fail();
+        } catch (VersionConflictEngineException e) {
+            // we ignore version conflicts on replicas, see TransportShardReplicationOperationAction.ignoreReplicaException.
+        }
+        replicaEngine.refresh(new Engine.Refresh("test").force(true));
+        Engine.Searcher replicaSearcher = replicaEngine.acquireSearcher("test");
+        topDocs = replicaSearcher.searcher().search(new MatchAllDocsQuery(), 10);
+        assertThat(topDocs.totalHits, equalTo(1));
+        searcher.close();
+        replicaSearcher.close();
+    }
+
 }

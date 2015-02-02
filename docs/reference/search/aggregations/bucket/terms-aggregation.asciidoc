@@ -337,7 +337,7 @@ PATH                :=  <AGG_NAME>[<AGG_SEPARATOR><AGG_NAME>]*[<METRIC_SEPARATOR
             },
             "aggs" : {
                 "females" : {
-                    "filter" : { "term" : { "gender" : { "female" }}},
+                    "filter" : { "term" : { "gender" :  "female" }},
                     "aggs" : {
                         "height_stats" : { "stats" : { "field" : "height" }}
                     }
@@ -360,7 +360,7 @@ It is possible to only return terms that match more than a configured number of 
     "aggs" : {
         "tags" : {
             "terms" : {
-                "field" : "tag",
+                "field" : "tags",
                 "min_doc_count": 10
             }
         }
@@ -586,10 +586,6 @@ this would typically be too costly in terms of RAM.
 
 [[search-aggregations-bucket-terms-aggregation-execution-hint]]
 ==== Execution hint
-
-Added the `global_ordinals`, `global_ordinals_hash` and `global_ordinals_low_cardinality` execution modes
-
-Removed the `ordinals` execution mode
 
 There are different mechanisms by which terms aggregations can be executed:
 

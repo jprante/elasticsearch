@@ -26,6 +26,7 @@ import org.apache.lucene.store.*;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.TestUtil;
+import org.apache.lucene.util.Version;
 import org.elasticsearch.common.settings.ImmutableSettings;
 import org.elasticsearch.index.Index;
 import org.elasticsearch.index.shard.ShardId;
@@ -39,6 +40,7 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.file.NoSuchFileException;
 import java.util.*;
+import java.util.zip.Adler32;
 
 import static com.carrotsearch.randomizedtesting.RandomizedTest.*;
 import static org.hamcrest.Matchers.*;
@@ -374,6 +376,192 @@ public class StoreTest extends ElasticsearchLuceneTestCase {
         IOUtils.close(store);
     }
 
+    // Test cases with incorrect adler32 in their metadata caused by old versions.
+
+    @Test
+    public void testBuggyTIIChecksums() throws IOException {
+        final ShardId shardId = new ShardId(new Index("index"), 1);
+        DirectoryService directoryService = new LuceneManagedDirectoryService(random(), false);
+        Store store = new Store(shardId, ImmutableSettings.EMPTY,  null, directoryService, randomDistributor(directoryService));
+
+        // .tii: no version specified
+        StoreFileMetaData tii = new StoreFileMetaData("foo.tii", 20, "boguschecksum", null);
+        assertTrue(Store.isUnreliableLegacyChecksum(tii));
+        try (VerifyingIndexOutput output = (VerifyingIndexOutput) store.createVerifyingOutput("foo.temp", tii, IOContext.DEFAULT)) {
+            output.writeBytes(new byte[20], 20);
+            output.verify();
+        }
+        
+        // .tii: old version
+        tii = new StoreFileMetaData("foo.tii", 20, "boguschecksum", Version.LUCENE_36);
+        assertTrue(Store.isUnreliableLegacyChecksum(tii));
+        try (VerifyingIndexOutput output = (VerifyingIndexOutput) store.createVerifyingOutput("foo.temp2", tii, IOContext.DEFAULT)) {
+            output.writeBytes(new byte[20], 20);
+            output.verify();
+        }
+        
+        // .tii: checkIntegrity
+        tii = new StoreFileMetaData("foo.tii", 20, "boguschecksum", Version.LUCENE_36);
+        assertTrue(Store.isUnreliableLegacyChecksum(tii));
+        try (VerifyingIndexOutput output = (VerifyingIndexOutput) store.createVerifyingOutput("foo.tii", tii, IOContext.DEFAULT)) {
+            output.writeBytes(new byte[20], 20);
+            output.verify();
+        }
+        assertTrue(store.checkIntegrity(tii));
+        store.close();
+    }
+
+    @Test
+    public void testBuggyTISChecksums() throws IOException {
+        final ShardId shardId = new ShardId(new Index("index"), 1);
+        DirectoryService directoryService = new LuceneManagedDirectoryService(random(), false);
+        Store store = new Store(shardId, ImmutableSettings.EMPTY,  null, directoryService, randomDistributor(directoryService));
+
+        // .tis: no version specified
+        StoreFileMetaData tis = new StoreFileMetaData("foo.tis", 20, "boguschecksum", null);
+        assertTrue(Store.isUnreliableLegacyChecksum(tis));
+        try (VerifyingIndexOutput output = (VerifyingIndexOutput) store.createVerifyingOutput("foo.temp", tis, IOContext.DEFAULT)) {
+            output.writeBytes(new byte[20], 20);
+            output.verify();
+        };
+
+        // .tis: old version
+        tis = new StoreFileMetaData("foo.tis", 20, "boguschecksum", Version.LUCENE_36);
+        assertTrue(Store.isUnreliableLegacyChecksum(tis));
+        try (VerifyingIndexOutput output = (VerifyingIndexOutput) store.createVerifyingOutput("foo.temp", tis, IOContext.DEFAULT)) {
+            output.writeBytes(new byte[20], 20);
+            output.verify();
+        };
+        
+        // .tis: checkIntegrity
+        tis = new StoreFileMetaData("foo.tis", 20, "boguschecksum", Version.LUCENE_36);
+        assertTrue(Store.isUnreliableLegacyChecksum(tis));
+        try (VerifyingIndexOutput output = (VerifyingIndexOutput) store.createVerifyingOutput("foo.tis", tis, IOContext.DEFAULT)) {
+            output.writeBytes(new byte[20], 20);
+            output.verify();
+        };
+        assertTrue(store.checkIntegrity(tis));
+
+        store.close();
+    }
+
+    @Test
+    public void testBuggyCFSChecksums() throws IOException {
+        final ShardId shardId = new ShardId(new Index("index"), 1);
+        DirectoryService directoryService = new LuceneManagedDirectoryService(random(), false);
+        Store store = new Store(shardId, ImmutableSettings.EMPTY,  null, directoryService, randomDistributor(directoryService));
+
+        // .cfs: unspecified version
+        StoreFileMetaData cfs = new StoreFileMetaData("foo.cfs", 20, "boguschecksum", null);
+        assertTrue(Store.isUnreliableLegacyChecksum(cfs));
+        try (VerifyingIndexOutput output = (VerifyingIndexOutput) store.createVerifyingOutput("foo.temp", cfs, IOContext.DEFAULT)) {
+            output.writeBytes(new byte[20], 20);
+            output.verify();
+        }
+
+        // .cfs: ancient affected version
+        cfs = new StoreFileMetaData("foo.cfs", 20, "boguschecksum", Version.LUCENE_33);
+        assertTrue(Store.isUnreliableLegacyChecksum(cfs));
+        try (VerifyingIndexOutput output = (VerifyingIndexOutput) store.createVerifyingOutput("foo.temp2", cfs, IOContext.DEFAULT)) {
+            output.writeBytes(new byte[20], 20);
+            output.verify();
+        }
+
+        // .cfs: should still be checksummed for an ok version
+        cfs = new StoreFileMetaData("foo.cfs", 20, "boguschecksum", Version.LUCENE_34);
+        assertFalse(Store.isUnreliableLegacyChecksum(cfs));
+        try (VerifyingIndexOutput output = (VerifyingIndexOutput) store.createVerifyingOutput("foo.temp3", cfs, IOContext.DEFAULT)) {
+            output.writeBytes(new byte[20], 20);
+            output.verify();
+            fail("should have gotten expected exception");
+        } catch (CorruptIndexException expected) {
+            assertTrue(expected.getMessage().startsWith("checksum failed"));
+        }
+        
+        // .cfs: checkIntegrity
+        cfs = new StoreFileMetaData("foo.cfs", 20, "boguschecksum", Version.LUCENE_33);
+        assertTrue(Store.isUnreliableLegacyChecksum(cfs));
+        try (VerifyingIndexOutput output = (VerifyingIndexOutput) store.createVerifyingOutput("foo.cfs", cfs, IOContext.DEFAULT)) {
+            output.writeBytes(new byte[20], 20);
+            output.verify();
+        }
+        assertTrue(store.checkIntegrity(cfs));
+
+        store.close();
+    }
+
+    @Test
+    public void testSegmentsNChecksums() throws IOException {
+        final ShardId shardId = new ShardId(new Index("index"), 1);
+        DirectoryService directoryService = new LuceneManagedDirectoryService(random(), false);
+        Store store = new Store(shardId, ImmutableSettings.EMPTY,  null, directoryService, randomDistributor(directoryService));
+
+        // segments_N: unspecified version
+        StoreFileMetaData segments = new StoreFileMetaData("segments_1", 20, "boguschecksum", null);
+        assertTrue(Store.isUnreliableLegacyChecksum(segments));
+        try (VerifyingIndexOutput output = (VerifyingIndexOutput) store.createVerifyingOutput("foo.temp", segments, IOContext.DEFAULT)) {
+            output.writeBytes(new byte[20], 20);
+            output.verify();
+        }
+
+        // segments_N: specified old version
+        segments = new StoreFileMetaData("segments_2", 20, "boguschecksum", Version.LUCENE_33);
+        assertTrue(Store.isUnreliableLegacyChecksum(segments));
+        try (VerifyingIndexOutput output = (VerifyingIndexOutput) store.createVerifyingOutput("foo.temp2", segments, IOContext.DEFAULT)) {
+            output.writeBytes(new byte[20], 20);
+            output.verify();
+        }
+
+        // segments_N: should still be checksummed for an ok version (lucene checksum)
+        segments = new StoreFileMetaData("segments_3", 20, "boguschecksum", Version.LUCENE_48);
+        assertFalse(Store.isUnreliableLegacyChecksum(segments));
+        try (VerifyingIndexOutput output = (VerifyingIndexOutput) store.createVerifyingOutput("foo.temp3", segments, IOContext.DEFAULT)) {
+            output.writeBytes(new byte[20], 20);
+            output.verify();
+            fail("should have gotten expected exception");
+        } catch (CorruptIndexException expected) {
+            assertTrue(expected.getMessage().startsWith("checksum failed"));
+        }
+
+        store.close();
+    }
+
+    @Test
+    public void testSegmentsGenChecksums() throws IOException {
+        final ShardId shardId = new ShardId(new Index("index"), 1);
+        DirectoryService directoryService = new LuceneManagedDirectoryService(random(), false);
+        Store store = new Store(shardId, ImmutableSettings.EMPTY,  null, directoryService, randomDistributor(directoryService));
+
+        // segments.gen: unspecified version
+        StoreFileMetaData segmentsGen = new StoreFileMetaData("segments.gen", 20, "boguschecksum", null);
+        assertTrue(Store.isUnreliableLegacyChecksum(segmentsGen));
+        try (VerifyingIndexOutput output = (VerifyingIndexOutput) store.createVerifyingOutput("foo.temp", segmentsGen, IOContext.DEFAULT)) {
+            output.writeBytes(new byte[20], 20);
+            output.verify();
+        }
+
+        // segments.gen: specified old version
+        segmentsGen = new StoreFileMetaData("segments.gen", 20, "boguschecksum", Version.LUCENE_33);
+        assertTrue(Store.isUnreliableLegacyChecksum(segmentsGen));
+        try (VerifyingIndexOutput output = (VerifyingIndexOutput) store.createVerifyingOutput("foo.temp2", segmentsGen, IOContext.DEFAULT)) {
+            output.writeBytes(new byte[20], 20);
+            output.verify();
+        }
+
+        // segments.gen: should still be checksummed for an ok version (lucene checksum)
+        segmentsGen = new StoreFileMetaData("segments.gen", 20, "boguschecksum", Version.LUCENE_48);
+        assertFalse(Store.isUnreliableLegacyChecksum(segmentsGen));
+        try (VerifyingIndexOutput output = (VerifyingIndexOutput) store.createVerifyingOutput("foo.temp3", segmentsGen, IOContext.DEFAULT)) {
+            output.writeBytes(new byte[20], 20);
+            output.verify();
+            fail("should have gotten expected exception");
+        } catch (CorruptIndexException expected) {
+            assertTrue(expected.getMessage().startsWith("checksum failed"));
+        }
+
+        store.close();
+    }
+
     @Test
     public void testRenameFile() throws IOException {
         final ShardId shardId = new ShardId(new Index("index"), 1);
@@ -425,6 +613,79 @@ public class StoreTest extends ElasticsearchLuceneTestCase {
         assertThat(store.directory().listAll().length, is(2));
         assertDeleteContent(store, directoryService);
         IOUtils.close(store);
+    }
+
+    public void testCheckIntegrity() throws IOException {
+        Directory dir = newDirectory();
+        long luceneFileLength = 0;
+
+        try (IndexOutput output = dir.createOutput("lucene_checksum.bin", IOContext.DEFAULT)) {
+            int iters = scaledRandomIntBetween(10, 100);
+            for (int i = 0; i < iters; i++) {
+                BytesRef bytesRef = new BytesRef(TestUtil.randomRealisticUnicodeString(random(), 10, 1024));
+                output.writeBytes(bytesRef.bytes, bytesRef.offset, bytesRef.length);
+                luceneFileLength += bytesRef.length;
+            }
+            CodecUtil.writeFooter(output);
+            luceneFileLength += CodecUtil.footerLength();
+
+        }
+
+        final Adler32 adler32 = new Adler32();
+        long legacyFileLength = 0;
+        try (IndexOutput output = dir.createOutput("legacy.bin", IOContext.DEFAULT)) {
+            int iters = scaledRandomIntBetween(10, 100);
+            for (int i = 0; i < iters; i++) {
+                BytesRef bytesRef = new BytesRef(TestUtil.randomRealisticUnicodeString(random(), 10, 1024));
+                output.writeBytes(bytesRef.bytes, bytesRef.offset, bytesRef.length);
+                adler32.update(bytesRef.bytes, bytesRef.offset, bytesRef.length);
+                legacyFileLength += bytesRef.length;
+            }
+        }
+        final long luceneChecksum;
+        final long adler32LegacyChecksum = adler32.getValue();
+        try(IndexInput indexInput = dir.openInput("lucene_checksum.bin", IOContext.DEFAULT)) {
+            assertEquals(luceneFileLength, indexInput.length());
+            luceneChecksum = CodecUtil.retrieveChecksum(indexInput);
+        }
+
+        { // positive check
+            StoreFileMetaData lucene = new StoreFileMetaData("lucene_checksum.bin", luceneFileLength, Store.digestToString(luceneChecksum), Version.LUCENE_48);
+            StoreFileMetaData legacy = new StoreFileMetaData("legacy.bin", legacyFileLength, Store.digestToString(adler32LegacyChecksum));
+            assertTrue(legacy.hasLegacyChecksum());
+            assertFalse(lucene.hasLegacyChecksum());
+            assertTrue(Store.checkIntegrity(lucene, dir));
+            assertTrue(Store.checkIntegrity(legacy, dir));
+        }
+
+        { // negative check - wrong checksum
+            StoreFileMetaData lucene = new StoreFileMetaData("lucene_checksum.bin", luceneFileLength, Store.digestToString(luceneChecksum+1), Version.LUCENE_48);
+            StoreFileMetaData legacy = new StoreFileMetaData("legacy.bin", legacyFileLength, Store.digestToString(adler32LegacyChecksum+1));
+            assertTrue(legacy.hasLegacyChecksum());
+            assertFalse(lucene.hasLegacyChecksum());
+            assertFalse(Store.checkIntegrity(lucene, dir));
+            assertFalse(Store.checkIntegrity(legacy, dir));
+        }
+
+        { // negative check - wrong length
+            StoreFileMetaData lucene = new StoreFileMetaData("lucene_checksum.bin", luceneFileLength+1, Store.digestToString(luceneChecksum), Version.LUCENE_48);
+            StoreFileMetaData legacy = new StoreFileMetaData("legacy.bin", legacyFileLength+1, Store.digestToString(adler32LegacyChecksum));
+            assertTrue(legacy.hasLegacyChecksum());
+            assertFalse(lucene.hasLegacyChecksum());
+            assertFalse(Store.checkIntegrity(lucene, dir));
+            assertFalse(Store.checkIntegrity(legacy, dir));
+        }
+
+        { // negative check - wrong file
+            StoreFileMetaData lucene = new StoreFileMetaData("legacy.bin", luceneFileLength, Store.digestToString(luceneChecksum), Version.LUCENE_48);
+            StoreFileMetaData legacy = new StoreFileMetaData("lucene_checksum.bin", legacyFileLength, Store.digestToString(adler32LegacyChecksum));
+            assertTrue(legacy.hasLegacyChecksum());
+            assertFalse(lucene.hasLegacyChecksum());
+            assertFalse(Store.checkIntegrity(lucene, dir));
+            assertFalse(Store.checkIntegrity(legacy, dir));
+        }
+        dir.close();
+
     }
 
     @Test

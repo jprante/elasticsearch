@@ -1,6 +1,6 @@
 {
   "indices.flush": {
-    "documentation": "http://www.elasticsearch.org/guide/en/elasticsearch/reference/1.x/indices-flush.html",
+    "documentation": "http://www.elasticsearch.org/guide/en/elasticsearch/reference/1.4/indices-flush.html",
     "methods": ["POST", "GET"],
     "url": {
       "path": "/_flush",
@@ -34,7 +34,7 @@
         },
         "expand_wildcards": {
             "type" : "enum",
-            "options" : ["open","closed"],
+            "options" : ["open","closed","none","all"],
             "default" : "open",
             "description" : "Whether to expand wildcard expression to concrete indices that are open, closed or both."
         }

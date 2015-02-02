@@ -20,12 +20,11 @@ package org.elasticsearch.search.aggregations.bucket.nested;
 
 import com.carrotsearch.hppc.LongIntOpenHashMap;
 import org.apache.lucene.index.AtomicReaderContext;
-import org.apache.lucene.search.DocIdSet;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.Filter;
+import org.apache.lucene.util.FixedBitSet;
 import org.elasticsearch.common.lease.Releasables;
 import org.elasticsearch.common.lucene.ReaderContextAware;
-import org.elasticsearch.common.lucene.docset.DocIdSets;
 import org.elasticsearch.common.recycler.Recycler;
 import org.elasticsearch.index.cache.fixedbitset.FixedBitSetFilter;
 import org.elasticsearch.index.mapper.MapperService;
@@ -35,7 +34,6 @@ import org.elasticsearch.search.SearchParseException;
 import org.elasticsearch.search.aggregations.*;
 import org.elasticsearch.search.aggregations.bucket.SingleBucketAggregator;
 import org.elasticsearch.search.aggregations.support.AggregationContext;
-import org.elasticsearch.search.internal.SearchContext;
 
 import java.io.IOException;
 
@@ -45,7 +43,9 @@ import java.io.IOException;
 public class ReverseNestedAggregator extends SingleBucketAggregator implements ReaderContextAware {
 
     private final FixedBitSetFilter parentFilter;
-    private DocIdSetIterator parentDocs;
+    // It is ok to use bitset from bitset cache, because in this agg the path always to a nested parent path.
+    private FixedBitSet parentDocs;
+    private final String nestedPath;
 
     // TODO: Add LongIntPagedHashMap?
     private final Recycler.V<LongIntOpenHashMap> bucketOrdToLastCollectedParentDocRecycler;
@@ -53,6 +53,7 @@ public class ReverseNestedAggregator extends SingleBucketAggregator implements R
 
     public ReverseNestedAggregator(String name, AggregatorFactories factories, String nestedPath, AggregationContext aggregationContext, Aggregator parent) {
         super(name, factories, aggregationContext, parent);
+        this.nestedPath = nestedPath;
 
         // Early validation
         NestedAggregator closestNestedAggregator = findClosestNestedAggregator(parent);
@@ -60,9 +61,9 @@ public class ReverseNestedAggregator extends SingleBucketAggregator implements R
             throw new SearchParseException(context.searchContext(), "Reverse nested aggregation [" + name + "] can only be used inside a [nested] aggregation");
         }
         if (nestedPath == null) {
-            parentFilter = SearchContext.current().fixedBitSetFilterCache().getFixedBitSetFilter(NonNestedDocsFilter.INSTANCE);
+            parentFilter = context.searchContext().fixedBitSetFilterCache().getFixedBitSetFilter(NonNestedDocsFilter.INSTANCE);
         } else {
-            MapperService.SmartNameObjectMapper mapper = SearchContext.current().smartNameObjectMapper(nestedPath);
+            MapperService.SmartNameObjectMapper mapper = context.searchContext().smartNameObjectMapper(nestedPath);
             if (mapper == null) {
                 throw new AggregationExecutionException("[reverse_nested] nested path [" + nestedPath + "] not found");
             }
@@ -73,7 +74,7 @@ public class ReverseNestedAggregator extends SingleBucketAggregator implements R
             if (!objectMapper.nested().isNested()) {
                 throw new AggregationExecutionException("[reverse_nested] nested path [" + nestedPath + "] is not nested");
             }
-            parentFilter = SearchContext.current().fixedBitSetFilterCache().getFixedBitSetFilter(objectMapper.nestedTypeFilter());
+            parentFilter = context.searchContext().fixedBitSetFilterCache().getFixedBitSetFilter(objectMapper.nestedTypeFilter());
         }
         bucketOrdToLastCollectedParentDocRecycler = aggregationContext.searchContext().cacheRecycler().longIntMap(32);
         bucketOrdToLastCollectedParentDoc = bucketOrdToLastCollectedParentDocRecycler.v();
@@ -86,12 +87,7 @@ public class ReverseNestedAggregator extends SingleBucketAggregator implements R
         try {
             // In ES if parent is deleted, then also the children are deleted, so the child docs this agg receives
             // must belong to parent docs that is alive. For this reason acceptedDocs can be null here.
-            DocIdSet docIdSet = parentFilter.getDocIdSet(reader, null);
-            if (DocIdSets.isEmpty(docIdSet)) {
-                parentDocs = null;
-            } else {
-                parentDocs = docIdSet.iterator();
-            }
+            parentDocs = parentFilter.getDocIdSet(reader, null);
         } catch (IOException ioe) {
             throw new AggregationExecutionException("Failed to aggregate [" + name + "]", ioe);
         }
@@ -104,12 +100,7 @@ public class ReverseNestedAggregator extends SingleBucketAggregator implements R
         }
 
         // fast forward to retrieve the parentDoc this childDoc belongs to
-        final int parentDoc;
-        if (parentDocs.docID() < childDoc) {
-            parentDoc = parentDocs.advance(childDoc);
-        } else {
-            parentDoc = parentDocs.docID();
-        }
+        final int parentDoc = parentDocs.nextSetBit(childDoc);
         assert childDoc <= parentDoc && parentDoc != DocIdSetIterator.NO_MORE_DOCS;
         if (bucketOrdToLastCollectedParentDoc.containsKey(bucketOrd)) {
             int lastCollectedParentDoc = bucketOrdToLastCollectedParentDoc.lget();
@@ -127,7 +118,7 @@ public class ReverseNestedAggregator extends SingleBucketAggregator implements R
         collectBucket(parentDoc, bucketOrd);
     }
 
-    private static NestedAggregator findClosestNestedAggregator(Aggregator parent) {
+    static NestedAggregator findClosestNestedAggregator(Aggregator parent) {
         for (; parent != null; parent = parent.parent()) {
             if (parent instanceof NestedAggregator) {
                 return (NestedAggregator) parent;
@@ -148,6 +139,10 @@ public class ReverseNestedAggregator extends SingleBucketAggregator implements R
 
     Filter getParentFilter() {
         return parentFilter;
+    }
+
+    public String getNestedPath() {
+        return nestedPath;
     }
 
     @Override

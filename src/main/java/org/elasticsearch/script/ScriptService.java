@@ -57,6 +57,8 @@ import org.elasticsearch.common.xcontent.XContentParser;
 import org.elasticsearch.common.xcontent.XContentType;
 import org.elasticsearch.env.Environment;
 import org.elasticsearch.index.query.TemplateQueryParser;
+import org.elasticsearch.node.settings.NodeSettingsService;
+import org.elasticsearch.script.groovy.GroovyScriptEngineService;
 import org.elasticsearch.search.lookup.SearchLookup;
 import org.elasticsearch.watcher.FileChangesListener;
 import org.elasticsearch.watcher.FileWatcher;
@@ -66,6 +68,8 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.util.Arrays;
+import java.nio.file.Files;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -93,6 +97,7 @@ public class ScriptService extends AbstractComponent {
 
     private final Cache<CacheKey, CompiledScript> cache;
     private final File scriptsDirectory;
+    private final FileWatcher fileWatcher;
 
     private final DynamicScriptDisabling dynamicScriptingDisabled;
 
@@ -209,9 +214,28 @@ public class ScriptService extends AbstractComponent {
         }
     }
 
+    class ApplySettings implements NodeSettingsService.Listener {
+        @Override
+        public void onRefreshSettings(Settings settings) {
+            GroovyScriptEngineService engine = (GroovyScriptEngineService) ScriptService.this.scriptEngines.get("groovy");
+            if (engine != null) {
+                String[] patches = settings.getAsArray(GroovyScriptEngineService.GROOVY_SCRIPT_BLACKLIST_PATCH, Strings.EMPTY_ARRAY);
+                boolean blacklistChanged = engine.addToBlacklist(patches);
+                if (blacklistChanged) {
+                    logger.info("adding {} to [{}], new blacklisted methods: {}", patches,
+                            GroovyScriptEngineService.GROOVY_SCRIPT_BLACKLIST_PATCH, engine.blacklistAdditions());
+                    engine.reloadConfig();
+                    // Because the GroovyScriptEngineService knows nothing about the
+                    // cache, we need to clear it here if the setting changes
+                    ScriptService.this.clearCache();
+                }
+            }
+        }
+    }
+
     @Inject
     public ScriptService(Settings settings, Environment env, Set<ScriptEngineService> scriptEngines,
-                         ResourceWatcherService resourceWatcherService) {
+                         ResourceWatcherService resourceWatcherService, NodeSettingsService nodeSettingsService) throws IOException {
         super(settings);
 
         int cacheMaxSize = settings.getAsInt(SCRIPT_CACHE_SIZE_SETTING, 100);
@@ -244,7 +268,7 @@ public class ScriptService extends AbstractComponent {
         if (logger.isTraceEnabled()) {
             logger.trace("Using scripts directory [{}] ", scriptsDirectory);
         }
-        FileWatcher fileWatcher = new FileWatcher(scriptsDirectory);
+        this.fileWatcher = new FileWatcher(scriptsDirectory);
         fileWatcher.addListener(new ScriptChangesListener());
 
         if (componentSettings.getAsBoolean("auto_reload_enabled", true)) {
@@ -254,6 +278,7 @@ public class ScriptService extends AbstractComponent {
             // automatic reload is disable just load scripts once
             fileWatcher.init();
         }
+        nodeSettingsService.addListener(new ApplySettings());
     }
 
     //This isn't set in the ctor because doing so creates a guice circular
@@ -274,6 +299,21 @@ public class ScriptService extends AbstractComponent {
 
     public CompiledScript compile(String lang, String script) {
         return compile(lang, script, ScriptType.INLINE);
+    }
+
+    /**
+     * Clear both the in memory and on disk compiled script caches. Files on
+     * disk will be treated as if they are new and recompiled.
+     * */
+    public void clearCache() {
+        logger.debug("clearing script cache");
+        // Clear the in-memory script caches
+        this.cache.invalidateAll();
+        this.cache.cleanUp();
+        // Clear the cache of on-disk scripts
+        this.staticCache.clear();
+        // Clear the file watcher's state so it re-compiles on-disk scripts
+        this.fileWatcher.clearState();
     }
 
     public CompiledScript compile(String lang,  String script, ScriptType scriptType) {
@@ -364,7 +404,7 @@ public class ScriptService extends AbstractComponent {
         String scriptLang = validateScriptLanguage(request.scriptLang());
         GetRequest getRequest = new GetRequest(request, SCRIPT_INDEX).type(scriptLang).id(request.id())
                 .version(request.version()).versionType(request.versionType())
-                .operationThreaded(false).preference("_local"); //Set preference for no forking
+                .preference("_local"); //Set preference for no forking
         client.get(getRequest, listener);
     }
 
@@ -419,7 +459,7 @@ public class ScriptService extends AbstractComponent {
         validate(request.safeSource(), scriptLang);
 
         IndexRequest indexRequest = new IndexRequest(request).index(SCRIPT_INDEX).type(scriptLang).id(request.id())
-                .listenerThreaded(false).operationThreaded(false).version(request.version()).versionType(request.versionType())
+                .version(request.version()).versionType(request.versionType())
                 .source(request.safeSource(), true).opType(request.opType()).refresh(true); //Always refresh after indexing a template
         client.index(indexRequest, listener);
     }

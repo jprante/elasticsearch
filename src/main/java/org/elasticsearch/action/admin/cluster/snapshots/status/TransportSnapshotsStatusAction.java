@@ -110,24 +110,25 @@ public class TransportSnapshotsStatusAction extends TransportMasterNodeOperation
                 snapshotIds[i] = currentSnapshots.get(i).snapshotId();
             }
 
-            transportNodesSnapshotsStatus.status(nodesIds.toArray(new String[nodesIds.size()]),
-                    snapshotIds, request.masterNodeTimeout(), new ActionListener<TransportNodesSnapshotsStatus.NodesSnapshotStatus>() {
-                        @Override
-                        public void onResponse(TransportNodesSnapshotsStatus.NodesSnapshotStatus nodeSnapshotStatuses) {
-                            try {
-                                ImmutableList<SnapshotMetaData.Entry> currentSnapshots =
-                                        snapshotsService.currentSnapshots(request.repository(), request.snapshots());
-                                listener.onResponse(buildResponse(request, currentSnapshots, nodeSnapshotStatuses));
-                            } catch (Throwable e) {
-                                listener.onFailure(e);
-                            }
-                        }
+            TransportNodesSnapshotsStatus.Request nodesRequest = new TransportNodesSnapshotsStatus.Request(request, nodesIds.toArray(new String[nodesIds.size()]))
+                    .snapshotIds(snapshotIds).timeout(request.masterNodeTimeout());
+            transportNodesSnapshotsStatus.execute(nodesRequest, new ActionListener<TransportNodesSnapshotsStatus.NodesSnapshotStatus>() {
+                @Override
+                public void onResponse(TransportNodesSnapshotsStatus.NodesSnapshotStatus nodeSnapshotStatuses) {
+                    try {
+                        ImmutableList<SnapshotMetaData.Entry> currentSnapshots =
+                                snapshotsService.currentSnapshots(request.repository(), request.snapshots());
+                        listener.onResponse(buildResponse(request, currentSnapshots, nodeSnapshotStatuses));
+                    } catch (Throwable e) {
+                        listener.onFailure(e);
+                    }
+                }
 
-                        @Override
-                        public void onFailure(Throwable e) {
-                            listener.onFailure(e);
-                        }
-                    });
+                @Override
+                public void onFailure(Throwable e) {
+                    listener.onFailure(e);
+                }
+            });
         } else {
             // We don't have any in-progress shards, just return current stats
             listener.onResponse(buildResponse(request, currentSnapshots, null));

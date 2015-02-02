@@ -22,6 +22,7 @@ package org.elasticsearch.index.mapper;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
+
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.FieldType;
@@ -610,9 +611,23 @@ public class DocumentMapper implements ToXContent {
 
     private XContentParser transform(XContentParser parser) throws IOException {
         Map<String, Object> transformed = transformSourceAsMap(parser.mapOrderedAndClose());
-        // TODO it'd be nice to have a MapXContent or something that could spit out the parser for this map
-        XContentBuilder builder = XContentFactory.smileBuilder().value(transformed);
-        return SmileXContent.smileXContent.createParser(builder.bytes());
+        XContentBuilder builder = XContentFactory.contentBuilder(parser.contentType()).value(transformed);
+        return parser.contentType().xContent().createParser(builder.bytes());
+    }
+
+    /**
+     * Returns the parent {@link ObjectMapper} instance of the specified object mapper or <code>null</code> if there
+     * isn't any.
+     */
+    // TODO: We should add: ObjectMapper#getParentObjectMapper()
+    public ObjectMapper findParentObjectMapper(ObjectMapper objectMapper) {
+        int indexOfLastDot = objectMapper.fullPath().lastIndexOf('.');
+        if (indexOfLastDot != -1) {
+            String parentNestObjectPath = objectMapper.fullPath().substring(0, indexOfLastDot);
+            return objectMappers().get(parentNestObjectPath);
+        } else {
+            return null;
+        }
     }
 
     public void addFieldMappers(List<FieldMapper> fieldMappers) {

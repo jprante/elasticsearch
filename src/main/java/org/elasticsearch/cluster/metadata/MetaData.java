@@ -688,7 +688,7 @@ public class MetaData implements Iterable<IndexMetaData> {
 
         // optimize for single element index (common case)
         if (aliasesOrIndices.length == 1) {
-            return concreteIndices(aliasesOrIndices[0], indicesOptions.allowNoIndices(), failClosed, indicesOptions.allowAliasesToMultipleIndices());
+            return concreteIndices(aliasesOrIndices[0], indicesOptions, !indicesOptions.allowNoIndices());
         }
 
         // check if its a possible aliased index, if not, just return the passed array
@@ -721,7 +721,7 @@ public class MetaData implements Iterable<IndexMetaData> {
 
         Set<String> actualIndices = new HashSet<>();
         for (String aliasOrIndex : aliasesOrIndices) {
-            String[] indices = concreteIndices(aliasOrIndex, indicesOptions.ignoreUnavailable(), failClosed, indicesOptions.allowAliasesToMultipleIndices());
+            String[] indices = concreteIndices(aliasOrIndex, indicesOptions, !indicesOptions.ignoreUnavailable());
             Collections.addAll(actualIndices, indices);
         }
 
@@ -732,16 +732,15 @@ public class MetaData implements Iterable<IndexMetaData> {
     }
 
     /**
-     *
      * Utility method that allows to resolve an index or alias to its corresponding single concrete index.
      * Callers should make sure they provide proper {@link org.elasticsearch.action.support.IndicesOptions}
      * that require a single index as a result. The indices resolution must in fact return a single index when
      * using this method, an {@link org.elasticsearch.ElasticsearchIllegalArgumentException} gets thrown otherwise.
      *
-     * @param indexOrAlias the index or alias to be resolved to concrete index
+     * @param indexOrAlias   the index or alias to be resolved to concrete index
      * @param indicesOptions the indices options to be used for the index resolution
      * @return the concrete index obtained as a result of the index resolution
-     * @throws IndexMissingException if the index or alias provided doesn't exist
+     * @throws IndexMissingException                 if the index or alias provided doesn't exist
      * @throws ElasticsearchIllegalArgumentException if the index resolution lead to more than one index
      */
     public String concreteSingleIndex(String indexOrAlias, IndicesOptions indicesOptions) throws IndexMissingException, ElasticsearchIllegalArgumentException {
@@ -752,30 +751,71 @@ public class MetaData implements Iterable<IndexMetaData> {
         return indices[0];
     }
 
-    private String[] concreteIndices(String aliasOrIndex, boolean allowNoIndices, boolean failClosed, boolean allowMultipleIndices) throws IndexMissingException, ElasticsearchIllegalArgumentException {
+    private String[] concreteIndices(String aliasOrIndex, IndicesOptions options, boolean failNoIndices) throws IndexMissingException, ElasticsearchIllegalArgumentException {
+        boolean failClosed = options.forbidClosedIndices() && !options.ignoreUnavailable();
+
         // a quick check, if this is an actual index, if so, return it
         IndexMetaData indexMetaData = indices.get(aliasOrIndex);
         if (indexMetaData != null) {
-            if (indexMetaData.getState() == IndexMetaData.State.CLOSE && failClosed) {
-               throw new IndexClosedException(new Index(aliasOrIndex));
+            if (indexMetaData.getState() == IndexMetaData.State.CLOSE) {
+                if (failClosed) {
+                    throw new IndexClosedException(new Index(aliasOrIndex));
+                } else {
+                    return options.forbidClosedIndices() ? Strings.EMPTY_ARRAY : new String[]{aliasOrIndex};
+                }
             } else {
-               return new String[]{aliasOrIndex};
+                return new String[]{aliasOrIndex};
             }
         }
         // not an actual index, fetch from an alias
         String[] indices = aliasAndIndexToIndexMap.getOrDefault(aliasOrIndex, Strings.EMPTY_ARRAY);
-        if (indices.length == 0 && !allowNoIndices) {
+        if (indices.length == 0 && failNoIndices) {
             throw new IndexMissingException(new Index(aliasOrIndex));
         }
-        if (indices.length > 1 && !allowMultipleIndices) {
+        if (indices.length > 1 && !options.allowAliasesToMultipleIndices()) {
             throw new ElasticsearchIllegalArgumentException("Alias [" + aliasOrIndex + "] has more than one indices associated with it [" + Arrays.toString(indices) + "], can't execute a single index op");
         }
 
-        indexMetaData = this.indices.get(aliasOrIndex);
-        if (indexMetaData != null && indexMetaData.getState() == IndexMetaData.State.CLOSE && failClosed) {
-            throw new IndexClosedException(new Index(aliasOrIndex));
+        // No need to check whether indices referred by aliases are closed, because there are no closed indices.
+        if (allClosedIndices.length == 0) {
+            return indices;
         }
-        return indices;
+
+        switch (indices.length) {
+            case 0:
+                return indices;
+            case 1:
+                indexMetaData = this.indices.get(indices[0]);
+                if (indexMetaData != null && indexMetaData.getState() == IndexMetaData.State.CLOSE) {
+                    if (failClosed) {
+                        throw new IndexClosedException(new Index(indexMetaData.getIndex()));
+                    } else {
+                        if (options.forbidClosedIndices()) {
+                            return Strings.EMPTY_ARRAY;
+                        }
+                    }
+                }
+                return indices;
+            default:
+                ObjectArrayList<String> concreteIndices = new ObjectArrayList<>();
+                for (String index : indices) {
+                    indexMetaData = this.indices.get(index);
+                    if (indexMetaData != null) {
+                        if (indexMetaData.getState() == IndexMetaData.State.CLOSE) {
+                            if (failClosed) {
+                                throw new IndexClosedException(new Index(indexMetaData.getIndex()));
+                            } else if (!options.forbidClosedIndices()) {
+                                concreteIndices.add(index);
+                            }
+                        } else if (indexMetaData.getState() == IndexMetaData.State.OPEN) {
+                            concreteIndices.add(index);
+                        } else {
+                            throw new IllegalStateException("index state [" + indexMetaData.getState() + "] not supported");
+                        }
+                    }
+                }
+                return concreteIndices.toArray(String.class);
+        }
     }
 
     /**
@@ -1326,7 +1366,7 @@ public class MetaData implements Iterable<IndexMetaData> {
 
             for (ObjectObjectCursor<String, Custom> cursor : metaData.customs()) {
                 Custom.Factory factory = lookupFactorySafe(cursor.key);
-                if(factory.context().contains(context)) {
+                if (factory.context().contains(context)) {
                     builder.startObject(cursor.key);
                     factory.toXContent(cursor.value, builder, params);
                     builder.endObject();

@@ -29,6 +29,7 @@ import org.elasticsearch.action.index.IndexResponse;
 import org.elasticsearch.action.search.SearchPhaseExecutionException;
 import org.elasticsearch.action.search.SearchResponse;
 import org.elasticsearch.client.Requests;
+import org.elasticsearch.common.settings.ImmutableSettings;
 import org.elasticsearch.common.settings.ImmutableSettings.Builder;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.unit.TimeValue;
@@ -50,9 +51,17 @@ import java.util.concurrent.ExecutionException;
 import static org.elasticsearch.common.settings.ImmutableSettings.settingsBuilder;
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertHitCount;
+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertNoFailures;
 
+@ElasticsearchIntegrationTest.ClusterScope(scope = ElasticsearchIntegrationTest.Scope.SUITE)
 public class SearchWithRandomExceptionsTests extends ElasticsearchIntegrationTest {
-    
+
+    @Override
+    protected Settings nodeSettings(int nodeOrdinal) {
+        return ImmutableSettings.builder().put(super.nodeSettings(nodeOrdinal))
+                .put("gateway.type", "local").build();
+    }
+
     @Test
     public void testRandomDirectoryIOExceptions() throws IOException, InterruptedException, ExecutionException {
         String mapping = XContentFactory.jsonBuilder().
@@ -86,14 +95,13 @@ public class SearchWithRandomExceptionsTests extends ElasticsearchIntegrationTes
             exceptionRate = 0d;
             exceptionOnOpenRate = 0d;
         }
-        boolean createIndexWithoutErrors = randomBoolean();
+        final boolean createIndexWithoutErrors = randomBoolean();
         long numInitialDocs = 0;
 
         if (createIndexWithoutErrors) {
             Builder settings = settingsBuilder()
                     .put("index.number_of_replicas", randomIntBetween(0, 1))
-                    .put(MockFSDirectoryService.CHECK_INDEX_ON_CLOSE, true)
-                    .put("gateway.type", "local");
+                    .put(MockFSDirectoryService.CHECK_INDEX_ON_CLOSE, true);
             logger.info("creating index: [test] using settings: [{}]", settings.build().getAsMap());
             client().admin().indices().prepareCreate("test")
                     .setSettings(settings)
@@ -101,7 +109,7 @@ public class SearchWithRandomExceptionsTests extends ElasticsearchIntegrationTes
             numInitialDocs = between(10, 100);
             ensureGreen();
             for (int i = 0; i < numInitialDocs ; i++) {
-                client().prepareIndex("test", "initial", "" + i).setSource("test", "init").get();
+                client().prepareIndex("test", "type", "init" + i).setSource("test", "init").get();
             }
             client().admin().indices().prepareRefresh("test").execute().get();
             client().admin().indices().prepareFlush("test").setWaitIfOngoing(true).execute().get();
@@ -173,7 +181,7 @@ public class SearchWithRandomExceptionsTests extends ElasticsearchIntegrationTes
                 searchResponse = client().prepareSearch().setTypes("type").setQuery(QueryBuilders.matchAllQuery()).get();
                 logger.info("Match all Successful shards: [{}]  numShards: [{}]", searchResponse.getSuccessfulShards(), numShards.numPrimaries);
                 if (searchResponse.getSuccessfulShards() == numShards.numPrimaries && !refreshFailed) {
-                    assertThat(searchResponse.getHits().getTotalHits(), Matchers.equalTo(numCreated));
+                    assertThat(searchResponse.getHits().getTotalHits(), Matchers.equalTo(numCreated + numInitialDocs));
                 }
             } catch (SearchPhaseExecutionException ex) {
                 logger.info("SearchPhaseException: [{}]", ex.getMessage());
@@ -192,7 +200,8 @@ public class SearchWithRandomExceptionsTests extends ElasticsearchIntegrationTes
                     .put(MockDirectoryHelper.RANDOM_IO_EXCEPTION_RATE_ON_OPEN, 0));
             client().admin().indices().prepareOpen("test").execute().get();
             ensureGreen();
-            SearchResponse searchResponse = client().prepareSearch().setTypes("initial").setQuery(QueryBuilders.matchQuery("test", "init")).get();
+            SearchResponse searchResponse = client().prepareSearch().setTypes("type").setQuery(QueryBuilders.matchQuery("test", "init")).get();
+            assertNoFailures(searchResponse);
             assertHitCount(searchResponse, numInitialDocs);
         }
     }
