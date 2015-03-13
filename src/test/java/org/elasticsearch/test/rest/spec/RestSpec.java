@@ -26,6 +26,7 @@ import org.elasticsearch.test.rest.support.FileUtils;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.util.Collection;
 import java.util.Map;
 
 /**
@@ -43,6 +44,10 @@ public class RestSpec {
 
     public RestApi getApi(String api) {
         return restApiMap.get(api);
+    }
+
+    public Collection<RestApi> getApis() {
+        return restApiMap.values();
     }
 
     /**

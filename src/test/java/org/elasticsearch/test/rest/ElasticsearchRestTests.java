@@ -35,6 +35,7 @@ import org.elasticsearch.test.rest.client.RestException;
 import org.elasticsearch.test.rest.parser.RestTestParseException;
 import org.elasticsearch.test.rest.parser.RestTestSuiteParser;
 import org.elasticsearch.test.rest.section.*;
+import org.elasticsearch.test.rest.spec.RestApi;
 import org.elasticsearch.test.rest.spec.RestSpec;
 import org.elasticsearch.test.rest.support.FileUtils;
 import org.junit.AfterClass;
@@ -69,6 +70,10 @@ public class ElasticsearchRestTests extends ElasticsearchIntegrationTest {
      * e.g. -Dtests.rest.blacklist=get/10_basic/*
      */
     public static final String REST_TESTS_BLACKLIST = "tests.rest.blacklist";
+    /**
+     * Property that allows to control whether spec validation is enabled or not (default true).
+     */
+    public static final String REST_TESTS_VALIDATE_SPEC = "tests.rest.validate_spec";
     /**
      * Property that allows to control where the REST spec files need to be loaded from
      */
@@ -180,7 +185,28 @@ public class ElasticsearchRestTests extends ElasticsearchIntegrationTest {
     public static void initExecutionContext() throws IOException, RestException {
         String[] specPaths = resolvePathsProperty(REST_TESTS_SPEC, DEFAULT_SPEC_PATH);
         RestSpec restSpec = RestSpec.parseFrom(DEFAULT_SPEC_PATH, specPaths);
+        validateSpec(restSpec);
         restTestExecutionContext = new RestTestExecutionContext(restSpec);
+    }
+
+    private static void validateSpec(RestSpec restSpec) {
+        boolean validateSpec = RandomizedTest.systemPropertyAsBoolean(REST_TESTS_VALIDATE_SPEC, true);
+        if (validateSpec) {
+            StringBuilder errorMessage = new StringBuilder();
+            for (RestApi restApi : restSpec.getApis()) {
+                if (restApi.getMethods().contains("GET") && restApi.isBodySupported()) {
+                    if (!restApi.getMethods().contains("POST")) {
+                        errorMessage.append("\n- ").append(restApi.getName()).append(" supports GET with a body but doesn't support POST");
+                    }
+                    if (!restApi.getParams().contains("source")) {
+                        errorMessage.append("\n- ").append(restApi.getName()).append(" supports GET with a body but doesn't support the source query string parameter");
+                    }
+                }
+            }
+            if (errorMessage.length() > 0) {
+                throw new IllegalArgumentException(errorMessage.toString());
+            }
+        }
     }
 
     @AfterClass
@@ -208,7 +234,7 @@ public class ElasticsearchRestTests extends ElasticsearchIntegrationTest {
             assumeFalse("[" + testCandidate.getTestPath() + "] skipped, reason: blacklisted", blacklistedPathMatcher.matches(Paths.get(testPath)));
         }
         //The client needs non static info to get initialized, therefore it can't be initialized in the before class
-        restTestExecutionContext.resetClient(cluster().httpAddresses(), restClientSettings());
+        restTestExecutionContext.initClient(cluster().httpAddresses(), restClientSettings());
         restTestExecutionContext.clear();
 
         //skip test if the whole suite (yaml file) is disabled
@@ -217,6 +243,12 @@ public class ElasticsearchRestTests extends ElasticsearchIntegrationTest {
         //skip test if test section is disabled
         assumeFalse(buildSkipMessage(testCandidate.getTestPath(), testCandidate.getTestSection().getSkipSection()),
                 testCandidate.getTestSection().getSkipSection().skip(restTestExecutionContext.esVersion()));
+    }
+
+    @Override
+    protected void afterTestFailed() {
+        //after we reset the global cluster, we have to make sure the client gets re-initialized too
+        restTestExecutionContext.resetClient();
     }
 
     private static String buildSkipMessage(String description, SkipSection skipSection) {

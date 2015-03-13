@@ -43,6 +43,8 @@ public class PendingClusterTask implements Streamable {
     }
 
     public PendingClusterTask(long insertOrder, Priority priority, Text source, long timeInQueue, boolean executing) {
+        assert timeInQueue >= 0 : "got a negative timeInQueue [" + timeInQueue + "]";
+        assert insertOrder >= 0 : "got a negative insertOrder [" + insertOrder + "]";
         this.insertOrder = insertOrder;
         this.priority = priority;
         this.source = source;
@@ -95,7 +97,6 @@ public class PendingClusterTask implements Streamable {
         Priority.writeTo(priority, out);
         out.writeText(source);
         if (out.getVersion().onOrAfter(Version.V_1_4_0)) {
-            // timeInQueue is set to -1 when unknown and can be negative if time goes backwards
             out.writeLong(timeInQueue);
         } else {
             out.writeVLong(timeInQueue);

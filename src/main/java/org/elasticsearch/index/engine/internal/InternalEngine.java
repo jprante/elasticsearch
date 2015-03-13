@@ -134,7 +134,11 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
     private final SearcherFactory searcherFactory = new SearchFactory();
     private volatile SearcherManager searcherManager;
 
-    private volatile boolean closed = false;
+    // a boolean indicating whether the engine is usable, i.e. was started but didn't fail or closed
+    private volatile boolean closedOrFailed = true;
+
+    // this is a marker to prevent double closing
+    private final AtomicBoolean isClosed = new AtomicBoolean(false);
 
     // flag indicating if a dirty operation has occurred since the last refresh
     private volatile boolean dirty = false;
@@ -146,7 +150,7 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
     // will not really happen, and then the commitUserData and the new translog will not be reflected
     private volatile boolean flushNeeded = false;
     private final AtomicInteger flushing = new AtomicInteger();
-    private final Lock flushLock = new ReentrantLock();
+    private final InternalLock flushLock = new InternalLock(new ReentrantLock());
 
     private final RecoveryCounter onGoingRecoveries = new RecoveryCounter();
 
@@ -162,7 +166,7 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
     private final ApplySettings applySettings = new ApplySettings();
 
     private volatile boolean failOnMergeFailure;
-    private Throwable failedEngine = null;
+    private volatile Throwable failedEngine = null;
     private final Lock failEngineLock = new ReentrantLock();
     private final CopyOnWriteArrayList<FailedEngineListener> failedEngineListeners = new CopyOnWriteArrayList<>();
 
@@ -263,7 +267,7 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
             if (indexWriter != null) {
                 throw new EngineAlreadyStartedException(shardId);
             }
-            if (closed) {
+            if (isClosed.get()) {
                 throw new EngineClosedException(shardId);
             }
             if (logger.isDebugEnabled()) {
@@ -309,6 +313,7 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
                 this.searcherManager = buildSearchManager(indexWriter);
                 versionMap.setManager(searcherManager);
                 readLastCommittedSegmentsInfo();
+                closedOrFailed = false;
             } catch (IOException e) {
                 maybeFailEngine(e, "start");
                 try {
@@ -534,7 +539,7 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
         // TODO: we force refresh when versionMap is using > 25% of IW's RAM buffer; should we make this separately configurable?
         if (versionMap.ramBytesUsedForRefresh() > 0.25 * indexingBufferSize.bytes() && versionMapRefreshPending.getAndSet(true) == false) {
             try {
-                if (closed) {
+                if (closedOrFailed) {
                     // no point...
                     return;
                 }
@@ -613,6 +618,7 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
             if (writer == null) {
                 throw new EngineClosedException(shardId, failedEngine);
             }
+            // NOTE: we don't throttle this when merges fall behind because delete-by-id does not create new segments:
             innerDelete(delete, writer);
             dirty = true;
             possibleMergeNeeded = true;
@@ -685,7 +691,19 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
             if (writer == null) {
                 throw new EngineClosedException(shardId);
             }
+            if (delete.origin() == Operation.Origin.RECOVERY) {
+                // Don't throttle recovery operations
+                innerDelete(delete, writer);
+            } else {
+                try (Releasable r = throttle.acquireThrottle()) {
+                    innerDelete(delete, writer);
+                }
+            }
+        }
+    }
 
+    private void innerDelete(DeleteByQuery delete, IndexWriter writer) throws EngineException {
+        try {
             Query query;
             if (delete.nested() && delete.aliasFilter() != null) {
                 query = new IncludeNestedDocsQuery(new XFilteredQuery(delete.query(), delete.aliasFilter()), delete.parentFilter());
@@ -848,109 +866,100 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
             throw new FlushNotAllowedEngineException(shardId, "already flushing...");
         }
 
-        flushLock.lock();
-        try {
+        final InternalLock lockNeeded;
+        switch (flush.type()) {
+            case NEW_WRITER:
+                lockNeeded = writeLock;
+                break;
+            case COMMIT:
+            case COMMIT_TRANSLOG:
+                lockNeeded = readLock;
+                break;
+            default:
+                throw new ElasticsearchIllegalStateException("flush type [" + flush.type() + "] not supported");
+        }
+
+        /*
+        we have to acquire the flush lock second to prevent dead locks and keep the locking order identical.
+        callers may already have acquired the read-write lock so we have to be consistent and always lock it first.
+        */
+        try (InternalLock _ = lockNeeded.acquire(); InternalLock flock = flushLock.acquire()) {
+            if (onGoingRecoveries.get() > 0 && flush.type() != Flush.Type.COMMIT) {
+                throw new FlushNotAllowedEngineException(shardId, "Recovery is in progress, flush is not allowed");
+            }
+            ensureOpen();
             if (flush.type() == Flush.Type.NEW_WRITER) {
-                try (InternalLock _ = writeLock.acquire()) {
-                    if (onGoingRecoveries.get() > 0) {
-                        throw new FlushNotAllowedEngineException(shardId, "Recovery is in progress, flush is not allowed");
+                // disable refreshing, not dirty
+                dirty = false;
+                try {
+                    { // commit and close the current writer - we write the current tanslog ID just in case
+                        final long translogId = translog.currentId();
+                        indexWriter.setCommitData(Collections.singletonMap(Translog.TRANSLOG_ID_KEY, Long.toString(translogId)));
+                        indexWriter.commit();
+                        indexWriter.rollback();
                     }
-                    // disable refreshing, not dirty
-                    dirty = false;
-                    try {
-                        { // commit and close the current writer - we write the current tanslog ID just in case
-                            final long translogId = translog.currentId();
-                            indexWriter.setCommitData(Collections.singletonMap(Translog.TRANSLOG_ID_KEY, Long.toString(translogId)));
-                            indexWriter.commit();
-                            indexWriter.rollback();
-                        }
-                        indexWriter = createWriter();
-                        mergeScheduler.removeListener(this.throttle);
+                    indexWriter = createWriter();
+                    mergeScheduler.removeListener(this.throttle);
 
-                        this.throttle = new IndexThrottle(mergeScheduler, this.logger, indexingService);
-                        mergeScheduler.addListener(throttle);
-                        // commit on a just opened writer will commit even if there are no changes done to it
-                        // we rely on that for the commit data translog id key
-                        if (flushNeeded || flush.force()) {
-                            flushNeeded = false;
-                            long translogId = translogIdGenerator.incrementAndGet();
-                            indexWriter.setCommitData(Collections.singletonMap(Translog.TRANSLOG_ID_KEY, Long.toString(translogId)));
-                            indexWriter.commit();
-                            translog.newTranslog(translogId);
-                        }
-
-                        SearcherManager current = this.searcherManager;
-                        this.searcherManager = buildSearchManager(indexWriter);
-                        versionMap.setManager(searcherManager);
-
-                        try {
-                            IOUtils.close(current);
-                        } catch (Throwable t) {
-                            logger.warn("Failed to close current SearcherManager", t);
-                        }
-
-                        maybePruneDeletedTombstones();
-
-                    } catch (Throwable t) {
-                        throw new FlushFailedEngineException(shardId, t);
-                    }
-                }
-            } else if (flush.type() == Flush.Type.COMMIT_TRANSLOG) {
-                try (InternalLock _ = readLock.acquire()) {
-                    final IndexWriter indexWriter = currentIndexWriter();
-                    if (onGoingRecoveries.get() > 0) {
-                        throw new FlushNotAllowedEngineException(shardId, "Recovery is in progress, flush is not allowed");
-                    }
-
+                    this.throttle = new IndexThrottle(mergeScheduler, this.logger, indexingService);
+                    mergeScheduler.addListener(throttle);
+                    // commit on a just opened writer will commit even if there are no changes done to it
+                    // we rely on that for the commit data translog id key
                     if (flushNeeded || flush.force()) {
                         flushNeeded = false;
-                        try {
-                            long translogId = translogIdGenerator.incrementAndGet();
-                            translog.newTransientTranslog(translogId);
-                            indexWriter.setCommitData(Collections.singletonMap(Translog.TRANSLOG_ID_KEY, Long.toString(translogId)));
-                            indexWriter.commit();
-                            // we need to refresh in order to clear older version values
-                            refresh(new Refresh("version_table_flush").force(true));
-                            // we need to move transient to current only after we refresh
-                            // so items added to current will still be around for realtime get
-                            // when tans overrides it
-                            translog.makeTransientCurrent();
+                        long translogId = translogIdGenerator.incrementAndGet();
+                        indexWriter.setCommitData(Collections.singletonMap(Translog.TRANSLOG_ID_KEY, Long.toString(translogId)));
+                        indexWriter.commit();
+                        translog.newTranslog(translogId);
+                    }
 
-                        } catch (Throwable e) {
-                            translog.revertTransient();
-                            throw new FlushFailedEngineException(shardId, e);
-                        }
+                    SearcherManager current = this.searcherManager;
+                    this.searcherManager = buildSearchManager(indexWriter);
+                    versionMap.setManager(searcherManager);
+
+                    try {
+                        IOUtils.close(current);
+                    } catch (Throwable t) {
+                        logger.warn("Failed to close current SearcherManager", t);
+                    }
+                } catch (Throwable t) {
+                    throw new FlushFailedEngineException(shardId, t);
+                }
+            } else if (flush.type() == Flush.Type.COMMIT_TRANSLOG) {
+                final IndexWriter indexWriter = currentIndexWriter();
+                if (flushNeeded || flush.force()) {
+                    flushNeeded = false;
+                    try {
+                        long translogId = translogIdGenerator.incrementAndGet();
+                        translog.newTransientTranslog(translogId);
+                        indexWriter.setCommitData(Collections.singletonMap(Translog.TRANSLOG_ID_KEY, Long.toString(translogId)));
+                        indexWriter.commit();
+                        // we need to refresh in order to clear older version values
+                        refresh(new Refresh("version_table_flush").force(true));
+                        // we need to move transient to current only after we refresh
+                        // so items added to current will still be around for realtime get
+                        // when tans overrides it
+                        translog.makeTransientCurrent();
+
+                    } catch (Throwable e) {
+                        translog.revertTransient();
+                        throw new FlushFailedEngineException(shardId, e);
                     }
                 }
-
-                // We don't have to do this here; we do it defensively to make sure that even if wall clock time is misbehaving
-                // (e.g., moves backwards) we will at least still sometimes prune deleted tombstones:
-                if (enableGcDeletes) {
-                    pruneDeletedTombstones();
-                }
-
             } else if (flush.type() == Flush.Type.COMMIT) {
                 // note, its ok to just commit without cleaning the translog, its perfectly fine to replay a
                 // translog on an index that was opened on a committed point in time that is "in the future"
                 // of that translog
-                try (InternalLock _ = readLock.acquire()) {
-                    final IndexWriter indexWriter = currentIndexWriter();
-                    // we allow to *just* commit if there is an ongoing recovery happening...
-                    // its ok to use this, only a flush will cause a new translogId, and we are locked here from
-                    // other flushes use flushLock
-                    try {
-                        long translogId = translog.currentId();
-                        indexWriter.setCommitData(Collections.singletonMap(Translog.TRANSLOG_ID_KEY, Long.toString(translogId)));
-                        indexWriter.commit();
-                    } catch (Throwable e) {
-                        throw new FlushFailedEngineException(shardId, e);
-                    }
-                }
-
-                // We don't have to do this here; we do it defensively to make sure that even if wall clock time is misbehaving
-                // (e.g., moves backwards) we will at least still sometimes prune deleted tombstones:
-                if (enableGcDeletes) {
-                    pruneDeletedTombstones();
+                final IndexWriter indexWriter = currentIndexWriter();
+                // we allow to *just* commit if there is an ongoing recovery happening...
+                // its ok to use this, only a flush will cause a new translogId, and we are locked here from
+                // other flushes use flushLock
+                try {
+                    long translogId = translog.currentId();
+                    indexWriter.setCommitData(Collections.singletonMap(Translog.TRANSLOG_ID_KEY, Long.toString(translogId)));
+                    indexWriter.commit();
+                } catch (Throwable e) {
+                    throw new FlushFailedEngineException(shardId, e);
                 }
 
             } else {
@@ -958,11 +967,10 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
             }
 
             // reread the last committed segment infos
-            try (InternalLock _ = readLock.acquire()) {
-                ensureOpen();
+            try {
                 readLastCommittedSegmentsInfo();
             } catch (Throwable e) {
-                if (!closed) {
+                if (closedOrFailed == false) {
                     logger.warn("failed to read latest segment infos on flush", e);
                     if (Lucene.isCorruptionException(e)) {
                         throw new FlushFailedEngineException(shardId, e);
@@ -973,13 +981,18 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
             maybeFailEngine(ex, "flush");
             throw ex;
         } finally {
-            flushLock.unlock();
             flushing.decrementAndGet();
+        }
+
+        // We don't have to do this here; we do it defensively to make sure that even if wall clock time is misbehaving
+        // (e.g., moves backwards) we will at least still sometimes prune deleted tombstones:
+        if (enableGcDeletes) {
+            pruneDeletedTombstones();
         }
     }
 
     private void ensureOpen() {
-        if (indexWriter == null) {
+        if (closedOrFailed) {
             throw new EngineClosedException(shardId, failedEngine);
         }
     }
@@ -990,8 +1003,10 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
      * @throws EngineClosedException if the engine is already closed
      */
     private IndexWriter currentIndexWriter() {
+        ensureOpen();
         final IndexWriter writer = indexWriter;
         if (writer == null) {
+            assert closedOrFailed : "Engine is not closed but writer is null";
             throw new EngineClosedException(shardId, failedEngine);
         }
         return writer;
@@ -1123,9 +1138,7 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
         // take a write lock here so it won't happen while a flush is in progress
         // this means that next commits will not be allowed once the lock is released
         try (InternalLock _ = writeLock.acquire()) {
-            if (closed) {
-                throw new EngineClosedException(shardId);
-            }
+            ensureOpen();
             onGoingRecoveries.startRecovery();
         }
 
@@ -1142,7 +1155,8 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
             recoveryHandler.phase1(phase1Snapshot);
         } catch (Throwable e) {
             maybeFailEngine(e, "recovery phase 1");
-            Releasables.closeWhileHandlingException(onGoingRecoveries, phase1Snapshot);
+            // close the snapshot first to release the reference to the translog file, so a flush post recovery can delete it
+            Releasables.closeWhileHandlingException(phase1Snapshot, onGoingRecoveries);
             throw new RecoveryEngineException(shardId, 1, "Execution failed", wrapIfClosed(e));
         }
 
@@ -1151,14 +1165,16 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
             phase2Snapshot = translog.snapshot();
         } catch (Throwable e) {
             maybeFailEngine(e, "snapshot recovery");
-            Releasables.closeWhileHandlingException(onGoingRecoveries, phase1Snapshot);
+            // close the snapshot first to release the reference to the translog file, so a flush post recovery can delete it
+            Releasables.closeWhileHandlingException(phase1Snapshot, onGoingRecoveries);
             throw new RecoveryEngineException(shardId, 2, "Snapshot failed", wrapIfClosed(e));
         }
         try {
             recoveryHandler.phase2(phase2Snapshot);
         } catch (Throwable e) {
             maybeFailEngine(e, "recovery phase 2");
-            Releasables.closeWhileHandlingException(onGoingRecoveries, phase1Snapshot, phase2Snapshot);
+            // close the snapshots first to release the reference to the translog file, so a flush post recovery can delete it
+            Releasables.closeWhileHandlingException(phase1Snapshot, phase2Snapshot, onGoingRecoveries);
             throw new RecoveryEngineException(shardId, 2, "Execution failed", wrapIfClosed(e));
         }
 
@@ -1173,8 +1189,9 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
             maybeFailEngine(e, "recovery phase 3");
             throw new RecoveryEngineException(shardId, 3, "Execution failed", wrapIfClosed(e));
         } finally {
-            Releasables.close(success, onGoingRecoveries, writeLock, phase1Snapshot,
-                    phase2Snapshot, phase3Snapshot); // hmm why can't we use try-with here?
+            // close the snapshots first to release the reference to the translog file, so a flush post recovery can delete it
+            Releasables.close(success, phase1Snapshot, phase2Snapshot, phase3Snapshot,
+                    onGoingRecoveries, writeLock); // hmm why can't we use try-with here?
         }
     }
 
@@ -1194,7 +1211,7 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
     }
 
     private Throwable wrapIfClosed(Throwable t) {
-        if (closed) {
+        if (closedOrFailed) {
             return new EngineClosedException(shardId, t);
         }
         return t;
@@ -1306,9 +1323,9 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
     @Override
     public void close() throws ElasticsearchException {
         try (InternalLock _ = writeLock.acquire()) {
-            if (!closed) {
+            if (isClosed.compareAndSet(false, true)) {
                 try {
-                    closed = true;
+                    closedOrFailed = true;
                     indexSettingsService.removeListener(applySettings);
                     this.versionMap.clear();
                     this.failedEngineListeners.clear();
@@ -1360,32 +1377,43 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
         assert failure != null;
         if (failEngineLock.tryLock()) {
             try {
-                // we first mark the store as corrupted before we notify any listeners
-                // this must happen first otherwise we might try to reallocate so quickly
-                // on the same node that we don't see the corrupted marker file when
-                // the shard is initializing
-                if (Lucene.isCorruptionException(failure)) {
-                    try {
-                        store.markStoreCorrupted(ExceptionsHelper.unwrap(failure, CorruptIndexException.class));
-                    } catch (IOException e) {
-                        logger.warn("Couldn't marks store corrupted", e);
-                    }
-                }
-            } finally {
-                assert !readLock.assertLockIsHeld() : "readLock is held by a thread that tries to fail the engine";
-                if (failedEngine != null) {
-                    logger.debug("tried to fail engine but engine is already failed. ignoring. [{}]", reason, failure);
-                    return;
-                }
                 try {
+                    // we first mark the store as corrupted before we notify any listeners
+                    // this must happen first otherwise we might try to reallocate so quickly
+                    // on the same node that we don't see the corrupted marker file when
+                    // the shard is initializing
+                    if (Lucene.isCorruptionException(failure)) {
+                        try {
+                            store.markStoreCorrupted(ExceptionsHelper.unwrap(failure, CorruptIndexException.class));
+                        } catch (IOException e) {
+                            logger.warn("Couldn't marks store corrupted", e);
+                        }
+                    }
+                } finally {
+                    if (failedEngine != null) {
+                        logger.debug("tried to fail engine but engine is already failed. ignoring. [{}]", reason, failure);
+                        return;
+                    }
                     logger.warn("failed engine [{}]", failure, reason);
                     // we must set a failure exception, generate one if not supplied
                     failedEngine = failure;
                     for (FailedEngineListener listener : failedEngineListeners) {
                         listener.onFailedEngine(shardId, reason, failure);
                     }
-                } finally {
-                    close();
+                }
+            } catch (Throwable t) {
+                // don't bubble up these exceptions up
+                logger.warn("failEngine threw exception", t);
+            } finally {
+                closedOrFailed = true;
+                try (InternalLock _ = readLock.acquire()) {
+                    // we take the readlock here to ensure nobody replaces this IW concurrently.
+                    if (indexWriter != null) {
+                        indexWriter.rollback();
+                    }
+                } catch (Throwable t) {
+                    logger.warn("Rolling back indexwriter on engine failure failed", t);
+                    // to be on the safe side we just rollback the IW
                 }
             }
         } else {
@@ -1458,7 +1486,7 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
                         }
                     } catch (Throwable t) {
                         // Don't fail a merge if the warm-up failed
-                        if (!closed) {
+                        if (!closedOrFailed) {
                             logger.warn("Warm-up failed", t);
                         }
                         if (t instanceof Error) {
@@ -1653,7 +1681,7 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
                     }
                     warmer.warmTopReader(new IndicesWarmer.WarmerContext(shardId, new SimpleSearcher("warmer", searcher)));
                 } catch (Throwable e) {
-                    if (!closed) {
+                    if (!closedOrFailed) {
                         logger.warn("failed to prepare/warm", e);
                     }
                 } finally {
@@ -1703,50 +1731,20 @@ public class InternalEngine extends AbstractIndexShardComponent implements Engin
     }
 
     private static final class InternalLock implements Releasable {
-        private final ThreadLocal<AtomicInteger> lockIsHeld;
         private final Lock lock;
 
         InternalLock(Lock lock) {
-            ThreadLocal<AtomicInteger> tl = null;
-            assert (tl = new ThreadLocal<>()) != null;
-            lockIsHeld = tl;
             this.lock = lock;
         }
 
         @Override
         public void close() {
             lock.unlock();
-            assert onAssertRelease();
         }
 
         InternalLock acquire() throws EngineException {
             lock.lock();
-            assert onAssertLock();
             return this;
-        }
-
-
-        protected boolean onAssertRelease() {
-            AtomicInteger count = lockIsHeld.get();
-            if (count.decrementAndGet() == 0) {
-                lockIsHeld.remove();
-            }
-            return true;
-        }
-
-        protected boolean onAssertLock() {
-            AtomicInteger count = lockIsHeld.get();
-            if (count == null) {
-                count = new AtomicInteger(0);
-                lockIsHeld.set(count);
-            }
-            count.incrementAndGet();
-            return true;
-        }
-
-        boolean assertLockIsHeld() {
-            AtomicInteger count = lockIsHeld.get();
-            return count != null && count.get() > 0;
         }
     }
 

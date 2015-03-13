@@ -149,6 +149,7 @@ public class ThreadPool extends AbstractComponent {
         this.scheduler = new ScheduledThreadPoolExecutor(1, EsExecutors.daemonThreadFactory(settings, "scheduler"), new EsAbortPolicy());
         this.scheduler.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
         this.scheduler.setContinueExistingPeriodicTasksAfterShutdownPolicy(false);
+        this.scheduler.setRemoveOnCancelPolicy(true);
         if (nodeSettingsService != null) {
             nodeSettingsService.addListener(new ApplySettings());
         }
@@ -729,5 +730,24 @@ public class ThreadPool extends AbstractComponent {
         public void onRefreshSettings(Settings settings) {
             updateSettings(settings);
         }
+    }
+
+    /**
+     * Returns <code>true</code> if the given service was terminated successfully. If the termination timed out,
+     * the service is <code>null</code> this method will return <code>false</code>.
+     */
+    public static boolean terminate(ExecutorService service, long timeout, TimeUnit timeUnit) {
+        if (service != null) {
+            service.shutdown();
+            try {
+                if (service.awaitTermination(timeout, timeUnit)) {
+                    return true;
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            service.shutdownNow();
+        }
+        return false;
     }
 }

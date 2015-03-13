@@ -19,6 +19,7 @@
 package org.elasticsearch.search.aggregations.bucket;
 
 import org.elasticsearch.action.index.IndexRequestBuilder;
+import org.elasticsearch.action.search.SearchPhaseExecutionException;
 import org.elasticsearch.action.search.SearchResponse;
 import org.elasticsearch.common.joda.Joda;
 import org.elasticsearch.common.settings.ImmutableSettings;
@@ -43,13 +44,15 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 
 import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
 import static org.elasticsearch.index.query.QueryBuilders.matchAllQuery;
 import static org.elasticsearch.search.aggregations.AggregationBuilders.*;
+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertSearchResponse;
-import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.*;
 import static org.hamcrest.core.IsNull.notNullValue;
 
 /**
@@ -1203,7 +1206,7 @@ public class DateHistogramTests extends ElasticsearchIntegrationTest {
 
     @Test
     public void singleValue_WithMultipleDateFormatsFromMapping() throws Exception {
-        
+
         String mappingJson = jsonBuilder().startObject().startObject("type").startObject("properties").startObject("date").field("type", "date").field("format", "dateOptionalTime||dd-MM-yyyy").endObject().endObject().endObject().endObject().string();
         prepareCreate("idx2").addMapping("type", mappingJson).execute().actionGet();
         IndexRequestBuilder[] reqs = new IndexRequestBuilder[5];
@@ -1260,5 +1263,82 @@ public class DateHistogramTests extends ElasticsearchIntegrationTest {
         assertThat(bucket, notNullValue());
         assertThat(bucket.getKeyAsNumber().longValue(), equalTo(key.getMillis()));
         assertThat(bucket.getDocCount(), equalTo(3l));
+    }
+
+    public void testDSTBoundaryIssue9491() throws InterruptedException, ExecutionException {
+        assertAcked(client().admin().indices().prepareCreate("test9491").addMapping("type", "d", "type=date").get());
+        indexRandom(true,
+                client().prepareIndex("test9491", "type").setSource("d", "2014-10-08T13:00:00Z"),
+                client().prepareIndex("test9491", "type").setSource("d", "2014-11-08T13:00:00Z"));
+        ensureSearchable("test9491");
+        SearchResponse response = client().prepareSearch("test9491")
+                .addAggregation(dateHistogram("histo").field("d").interval(DateHistogram.Interval.YEAR).preZone("Asia/Jerusalem")
+                .preZoneAdjustLargeInterval(true))
+                .execute().actionGet();
+        assertSearchResponse(response);
+        Histogram histo = response.getAggregations().get("histo");
+        assertThat(histo.getBuckets().size(), equalTo(1));
+        assertThat(histo.getBuckets().get(0).getKey(), equalTo("2013-12-31T22:00:00.000Z"));
+        assertThat(histo.getBuckets().get(0).getDocCount(), equalTo(2L));
+    }
+
+    public void testIssue7673() throws InterruptedException, ExecutionException {
+        assertAcked(client().admin().indices().prepareCreate("test7673").addMapping("type", "d", "type=date").get());
+        indexRandom(true,
+                client().prepareIndex("test7673", "type").setSource("d", "2013-07-01T00:00:00Z"),
+                client().prepareIndex("test7673", "type").setSource("d", "2013-09-01T00:00:00Z"));
+        ensureSearchable("test7673");
+        SearchResponse response = client().prepareSearch("test7673")
+                .addAggregation(dateHistogram("histo").field("d").interval(DateHistogram.Interval.MONTH).postZone("-02:00")
+                .minDocCount(0))
+                .execute().actionGet();
+        assertSearchResponse(response);
+        Histogram histo = response.getAggregations().get("histo");
+        assertThat(histo.getBuckets().size(), equalTo(3));
+        assertThat(histo.getBuckets().get(0).getKey(), equalTo("2013-06-30T22:00:00.000Z"));
+        assertThat(histo.getBuckets().get(0).getDocCount(), equalTo(1L));
+        assertThat(histo.getBuckets().get(1).getKey(), equalTo("2013-07-31T22:00:00.000Z"));
+        assertThat(histo.getBuckets().get(1).getDocCount(), equalTo(0L));
+        assertThat(histo.getBuckets().get(2).getKey(), equalTo("2013-08-31T22:00:00.000Z"));
+        assertThat(histo.getBuckets().get(2).getDocCount(), equalTo(1L));
+    }
+
+    public void testIssue8209() throws InterruptedException, ExecutionException {
+        assertAcked(client().admin().indices().prepareCreate("test8209").addMapping("type", "d", "type=date").get());
+        indexRandom(true,
+                client().prepareIndex("test8209", "type").setSource("d", "2014-01-01T0:00:00Z"),
+                client().prepareIndex("test8209", "type").setSource("d", "2014-04-01T0:00:00Z"),
+                client().prepareIndex("test8209", "type").setSource("d", "2014-04-30T0:00:00Z"));
+        ensureSearchable("test8209");
+        SearchResponse response = client().prepareSearch("test8209")
+                .addAggregation(dateHistogram("histo").field("d").interval(DateHistogram.Interval.MONTH).preZone("+01:00")
+                .minDocCount(0)
+                .preZoneAdjustLargeInterval(true))
+                .execute().actionGet();
+        assertSearchResponse(response);
+        Histogram histo = response.getAggregations().get("histo");
+        assertThat(histo.getBuckets().size(), equalTo(4));
+        assertThat(histo.getBuckets().get(0).getKey(), equalTo("2013-12-31T23:00:00.000Z"));
+        assertThat(histo.getBuckets().get(0).getDocCount(), equalTo(1L));
+        assertThat(histo.getBuckets().get(1).getKey(), equalTo("2014-01-31T23:00:00.000Z"));
+        assertThat(histo.getBuckets().get(1).getDocCount(), equalTo(0L));
+        assertThat(histo.getBuckets().get(2).getKey(), equalTo("2014-02-28T23:00:00.000Z"));
+        assertThat(histo.getBuckets().get(2).getDocCount(), equalTo(0L));
+        assertThat(histo.getBuckets().get(3).getKey(), equalTo("2014-03-31T23:00:00.000Z"));
+        assertThat(histo.getBuckets().get(3).getDocCount(), equalTo(2L));
+    }
+
+    /**
+     * see issue #9634, negative interval in date_histogram should raise exception
+     */
+    public void testExeptionOnNegativerInterval() {
+        try {
+            client().prepareSearch("idx")
+                    .addAggregation(dateHistogram("histo").field("date").interval(-TimeUnit.DAYS.toMillis(1)).minDocCount(0)).execute()
+                    .actionGet();
+            fail();
+        } catch (SearchPhaseExecutionException e) {
+            assertThat(e.getMessage(), containsString("IllegalArgumentException"));
+        }
     }
 }
