@@ -19,7 +19,6 @@ import org.gradle.api.tasks.Optional
 import org.gradle.api.tasks.TaskAction
 import org.gradle.api.tasks.util.PatternFilterable
 import org.gradle.api.tasks.util.PatternSet
-import org.gradle.logging.ProgressLoggerFactory
 import org.gradle.util.ConfigureUtil
 
 import javax.inject.Inject
@@ -85,13 +84,7 @@ class RandomizedTestingTask extends DefaultTask {
 
     RandomizedTestingTask() {
         outputs.upToDateWhen {false} // randomized tests are never up to date
-        listenersConfig.listeners.add(new TestProgressLogger(factory: getProgressLoggerFactory()))
         listenersConfig.listeners.add(new TestReportLogger(logger: logger, config: testLoggingConfig))
-    }
-
-    @Inject
-    ProgressLoggerFactory getProgressLoggerFactory() {
-        throw new UnsupportedOperationException();
     }
 
     void jvmArgs(Iterable<String> arguments) {

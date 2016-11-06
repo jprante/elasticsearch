@@ -18,10 +18,8 @@
  */
 package org.elasticsearch.gradle.vagrant
 
-import org.apache.commons.io.output.TeeOutputStream
 import org.elasticsearch.gradle.LoggedExec
 import org.gradle.api.tasks.Input
-import org.gradle.logging.ProgressLoggerFactory
 
 import javax.inject.Inject
 
@@ -36,23 +34,6 @@ public class VagrantCommandTask extends LoggedExec {
 
     public VagrantCommandTask() {
         executable = 'vagrant'
-        project.afterEvaluate {
-            // It'd be nice if --machine-readable were, well, nice
-            standardOutput = new TeeOutputStream(standardOutput, createLoggerOutputStream())
-        }
     }
 
-    protected OutputStream createLoggerOutputStream() {
-        return new VagrantLoggerOutputStream(
-            command: commandLine.join(' '),
-            factory: getProgressLoggerFactory(),
-            /* Vagrant tends to output a lot of stuff, but most of the important
-              stuff starts with ==> $box */
-            squashedPrefix: "==> $boxName: ")
-    }
-
-    @Inject
-    ProgressLoggerFactory getProgressLoggerFactory() {
-        throw new UnsupportedOperationException();
-    }
 }

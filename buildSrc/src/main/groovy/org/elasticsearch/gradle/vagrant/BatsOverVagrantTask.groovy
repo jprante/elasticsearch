@@ -21,7 +21,6 @@ package org.elasticsearch.gradle.vagrant
 import org.gradle.api.DefaultTask
 import org.gradle.api.tasks.Input
 import org.gradle.api.tasks.TaskAction
-import org.gradle.logging.ProgressLoggerFactory
 import org.gradle.process.internal.ExecAction
 import org.gradle.process.internal.ExecActionFactory
 
@@ -42,11 +41,4 @@ public class BatsOverVagrantTask extends VagrantCommandTask {
         }
     }
 
-    @Override
-    protected OutputStream createLoggerOutputStream() {
-        return new TapLoggerOutputStream(
-                command: commandLine.join(' '),
-                factory: getProgressLoggerFactory(),
-                logger: logger)
-    }
 }
