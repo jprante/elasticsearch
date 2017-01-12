@@ -74,7 +74,7 @@ public class RestIndicesActionTests extends ESTestCase {
 
     public void testBuildTable() {
         final Settings settings = Settings.EMPTY;
-        final RestController restController = new RestController(settings, Collections.emptySet());
+        final RestController restController = new RestController(settings, Collections.emptySet(), null);
         final RestIndicesAction action = new RestIndicesAction(settings, restController, new IndexNameExpressionResolver(settings));
 
         // build a (semi-)random table
@@ -158,7 +158,7 @@ public class RestIndicesActionTests extends ESTestCase {
                 stats.get = new GetStats();
                 stats.flush = new FlushStats();
                 stats.warmer = new WarmerStats();
-                shardStats.add(new ShardStats(shardRouting, new ShardPath(false, path, path, shardId), stats, null));
+                shardStats.add(new ShardStats(shardRouting, new ShardPath(false, path, path, shardId), stats, null, null));
             }
         }
         return IndicesStatsTests.newIndicesStatsResponse(

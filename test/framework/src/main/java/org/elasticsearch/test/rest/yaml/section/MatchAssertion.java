@@ -20,9 +20,12 @@ package org.elasticsearch.test.rest.yaml.section;
 
 import org.apache.logging.log4j.Logger;
 import org.elasticsearch.common.Nullable;
+import org.elasticsearch.common.collect.Tuple;
 import org.elasticsearch.common.logging.Loggers;
 import org.elasticsearch.common.xcontent.XContentLocation;
+import org.elasticsearch.common.xcontent.XContentParser;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -43,6 +46,11 @@ import static org.junit.Assert.assertThat;
  *
  */
 public class MatchAssertion extends Assertion {
+    public static MatchAssertion parse(XContentParser parser) throws IOException {
+        XContentLocation location = parser.getTokenLocation();
+        Tuple<String,Object> stringObjectTuple = ParserUtils.parseTuple(parser);
+        return new MatchAssertion(location, stringObjectTuple.v1(), stringObjectTuple.v2());
+    }
 
     private static final Logger logger = Loggers.getLogger(MatchAssertion.class);
 
@@ -173,6 +181,14 @@ public class MatchAssertion extends Assertion {
                 return;
             }
             if (Objects.equals(expected, actual)) {
+                if (expected instanceof String) {
+                    String expectedString = (String) expected;
+                    if (expectedString.length() > 50) {
+                        expectedString = expectedString.substring(0, 50) + "...";
+                    }
+                    field(field, "same [" + expectedString + "]");
+                    return;
+                }
                 field(field, "same [" + expected + "]");
                 return;
             }

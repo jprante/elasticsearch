@@ -19,6 +19,9 @@
 
 package org.apache.lucene.queryparser.classic;
 
+import static java.util.Collections.unmodifiableMap;
+import static org.elasticsearch.common.lucene.search.Queries.fixNegativeQueryIfNeeded;
+
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.TokenStream;
 import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
@@ -30,6 +33,7 @@ import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.BoostQuery;
 import org.apache.lucene.search.DisjunctionMaxQuery;
 import org.apache.lucene.search.FuzzyQuery;
+import org.apache.lucene.search.GraphQuery;
 import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.MultiPhraseQuery;
 import org.apache.lucene.search.PhraseQuery;
@@ -41,7 +45,6 @@ import org.apache.lucene.util.automaton.RegExp;
 import org.elasticsearch.common.lucene.search.Queries;
 import org.elasticsearch.common.unit.Fuzziness;
 import org.elasticsearch.index.mapper.DateFieldMapper;
-import org.elasticsearch.index.mapper.LegacyDateFieldMapper;
 import org.elasticsearch.index.mapper.MappedFieldType;
 import org.elasticsearch.index.mapper.MapperService;
 import org.elasticsearch.index.mapper.StringFieldType;
@@ -55,9 +58,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-
-import static java.util.Collections.unmodifiableMap;
-import static org.elasticsearch.common.lucene.search.Queries.fixNegativeQueryIfNeeded;
 
 /**
  * A query parser that uses the {@link MapperService} in order to build smarter
@@ -336,11 +336,7 @@ public class MapperQueryParser extends AnalyzingQueryParser {
                 BytesRef part1Binary = part1 == null ? null : getAnalyzer().normalize(field, part1);
                 BytesRef part2Binary = part2 == null ? null : getAnalyzer().normalize(field, part2);
                 Query rangeQuery;
-                if (currentFieldType instanceof LegacyDateFieldMapper.DateFieldType && settings.timeZone() != null) {
-                    LegacyDateFieldMapper.DateFieldType dateFieldType = (LegacyDateFieldMapper.DateFieldType) this.currentFieldType;
-                    rangeQuery = dateFieldType.rangeQuery(part1Binary, part2Binary,
-                            startInclusive, endInclusive, settings.timeZone(), null, context);
-                } else if (currentFieldType instanceof DateFieldMapper.DateFieldType && settings.timeZone() != null) {
+                if (currentFieldType instanceof DateFieldMapper.DateFieldType && settings.timeZone() != null) {
                     DateFieldMapper.DateFieldType dateFieldType = (DateFieldMapper.DateFieldType) this.currentFieldType;
                     rangeQuery = dateFieldType.rangeQuery(part1Binary, part2Binary,
                             startInclusive, endInclusive, settings.timeZone(), null, context);
@@ -744,25 +740,46 @@ public class MapperQueryParser extends AnalyzingQueryParser {
 
     private Query applySlop(Query q, int slop) {
         if (q instanceof PhraseQuery) {
-            PhraseQuery pq = (PhraseQuery) q;
-            PhraseQuery.Builder builder = new PhraseQuery.Builder();
-            builder.setSlop(slop);
-            final Term[] terms = pq.getTerms();
-            final int[] positions = pq.getPositions();
-            for (int i = 0; i < terms.length; ++i) {
-                builder.add(terms[i], positions[i]);
-            }
-            pq = builder.build();
             //make sure that the boost hasn't been set beforehand, otherwise we'd lose it
             assert q instanceof BoostQuery == false;
-            return pq;
+            return addSlopToPhrase((PhraseQuery) q, slop);
         } else if (q instanceof MultiPhraseQuery) {
             MultiPhraseQuery.Builder builder = new MultiPhraseQuery.Builder((MultiPhraseQuery) q);
             builder.setSlop(slop);
             return builder.build();
+        } else if (q instanceof GraphQuery && ((GraphQuery) q).hasPhrase()) {
+            // we have a graph query that has at least one phrase sub-query
+            // re-build and set slop on all phrase queries
+            List<Query> oldQueries = ((GraphQuery) q).getQueries();
+            Query[] queries = new Query[oldQueries.size()];
+            for (int i = 0; i < queries.length; i++) {
+                Query oldQuery = oldQueries.get(i);
+                if (oldQuery instanceof PhraseQuery) {
+                    queries[i] = addSlopToPhrase((PhraseQuery) oldQuery, slop);
+                } else {
+                    queries[i] = oldQuery;
+                }
+            }
+
+            return new GraphQuery(queries);
         } else {
             return q;
         }
+    }
+
+    /**
+     * Rebuild a phrase query with a slop value
+     */
+    private PhraseQuery addSlopToPhrase(PhraseQuery query, int slop) {
+        PhraseQuery.Builder builder = new PhraseQuery.Builder();
+        builder.setSlop(slop);
+        final Term[] terms = query.getTerms();
+        final int[] positions = query.getPositions();
+        for (int i = 0; i < terms.length; ++i) {
+            builder.add(terms[i], positions[i]);
+        }
+
+        return builder.build();
     }
 
     private Collection<String> extractMultiFields(String field) {

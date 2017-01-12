@@ -31,6 +31,7 @@ import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.transport.ConnectTransportException;
+import org.elasticsearch.transport.ConnectionProfile;
 import org.elasticsearch.transport.Transport;
 import org.elasticsearch.transport.TransportException;
 import org.elasticsearch.transport.TransportRequest;
@@ -42,6 +43,7 @@ import org.junit.AfterClass;
 import org.junit.Before;
 
 import java.io.IOException;
+import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -50,6 +52,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.hamcrest.Matchers.equalTo;
 
@@ -84,19 +87,19 @@ public class NodeConnectionsServiceTests extends ESTestCase {
         ClusterState current = clusterStateFromNodes(Collections.emptyList());
         ClusterChangedEvent event = new ClusterChangedEvent("test", clusterStateFromNodes(randomSubsetOf(nodes)), current);
 
-        service.connectToNodes(event.nodesDelta().addedNodes());
-        assertConnected(event.nodesDelta().addedNodes());
+        service.connectToNodes(event.state().nodes());
+        assertConnected(event.state().nodes());
 
-        service.disconnectFromNodes(event.nodesDelta().removedNodes());
+        service.disconnectFromNodesExcept(event.state().nodes());
         assertConnectedExactlyToNodes(event.state());
 
         current = event.state();
         event = new ClusterChangedEvent("test", clusterStateFromNodes(randomSubsetOf(nodes)), current);
 
-        service.connectToNodes(event.nodesDelta().addedNodes());
-        assertConnected(event.nodesDelta().addedNodes());
+        service.connectToNodes(event.state().nodes());
+        assertConnected(event.state().nodes());
 
-        service.disconnectFromNodes(event.nodesDelta().removedNodes());
+        service.disconnectFromNodesExcept(event.state().nodes());
         assertConnectedExactlyToNodes(event.state());
     }
 
@@ -168,13 +171,12 @@ public class NodeConnectionsServiceTests extends ESTestCase {
 
 
     final class MockTransport implements Transport {
-
+        private final AtomicLong requestId = new AtomicLong();
         Set<DiscoveryNode> connectedNodes = ConcurrentCollections.newConcurrentSet();
         volatile boolean randomConnectionExceptions = false;
 
         @Override
         public void transportServiceAdapter(TransportServiceAdapter service) {
-
         }
 
         @Override
@@ -188,13 +190,8 @@ public class NodeConnectionsServiceTests extends ESTestCase {
         }
 
         @Override
-        public TransportAddress[] addressesFromString(String address, int perAddressLimit) throws Exception {
+        public TransportAddress[] addressesFromString(String address, int perAddressLimit) throws UnknownHostException {
             return new TransportAddress[0];
-        }
-
-        @Override
-        public boolean addressSupported(Class<? extends TransportAddress> address) {
-            return false;
         }
 
         @Override
@@ -203,16 +200,13 @@ public class NodeConnectionsServiceTests extends ESTestCase {
         }
 
         @Override
-        public void connectToNode(DiscoveryNode node) throws ConnectTransportException {
-            if (connectedNodes.contains(node) == false && randomConnectionExceptions && randomBoolean()) {
-                throw new ConnectTransportException(node, "simulated");
+        public void connectToNode(DiscoveryNode node, ConnectionProfile connectionProfile) throws ConnectTransportException {
+            if (connectionProfile == null) {
+                if (connectedNodes.contains(node) == false && randomConnectionExceptions && randomBoolean()) {
+                    throw new ConnectTransportException(node, "simulated");
+                }
+                connectedNodes.add(node);
             }
-            connectedNodes.add(node);
-        }
-
-        @Override
-        public void connectToNodeLight(DiscoveryNode node) throws ConnectTransportException {
-
         }
 
         @Override
@@ -221,9 +215,29 @@ public class NodeConnectionsServiceTests extends ESTestCase {
         }
 
         @Override
-        public void sendRequest(DiscoveryNode node, long requestId, String action, TransportRequest request,
-                                TransportRequestOptions options) throws IOException, TransportException {
+        public Connection getConnection(DiscoveryNode node) {
+            return new Connection() {
+                @Override
+                public DiscoveryNode getNode() {
+                    return node;
+                }
 
+                @Override
+                public void sendRequest(long requestId, String action, TransportRequest request, TransportRequestOptions options)
+                    throws IOException, TransportException {
+
+                }
+
+                @Override
+                public void close() throws IOException {
+
+                }
+            };
+        }
+
+        @Override
+        public Connection openConnection(DiscoveryNode node, ConnectionProfile profile) throws IOException {
+            return getConnection(node);
         }
 
         @Override
@@ -234,6 +248,11 @@ public class NodeConnectionsServiceTests extends ESTestCase {
         @Override
         public List<String> getLocalAddresses() {
             return null;
+        }
+
+        @Override
+        public long newRequestId() {
+            return requestId.incrementAndGet();
         }
 
         @Override

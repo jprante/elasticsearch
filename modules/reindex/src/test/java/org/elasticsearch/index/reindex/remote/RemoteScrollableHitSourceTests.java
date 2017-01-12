@@ -48,6 +48,7 @@ import org.elasticsearch.common.io.Streams;
 import org.elasticsearch.common.unit.ByteSizeUnit;
 import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.common.util.concurrent.EsRejectedExecutionException;
 import org.elasticsearch.index.reindex.ScrollableHitSource.Response;
 import org.elasticsearch.rest.RestStatus;
@@ -64,7 +65,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
-import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -72,6 +73,7 @@ import java.util.function.Consumer;
 
 import static org.elasticsearch.common.unit.TimeValue.timeValueMillis;
 import static org.elasticsearch.common.unit.TimeValue.timeValueMinutes;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.instanceOf;
@@ -90,10 +92,11 @@ public class RemoteScrollableHitSourceTests extends ESTestCase {
     @Override
     public void setUp() throws Exception {
         super.setUp();
+        final ExecutorService directExecutor = EsExecutors.newDirectExecutorService();
         threadPool = new TestThreadPool(getTestName()) {
             @Override
-            public Executor executor(String name) {
-                return Runnable::run;
+            public ExecutorService executor(String name) {
+                return directExecutor;
             }
 
             @Override
@@ -118,37 +121,37 @@ public class RemoteScrollableHitSourceTests extends ESTestCase {
 
     public void testLookupRemoteVersion() throws Exception {
         AtomicBoolean called = new AtomicBoolean();
-        sourceWithMockedRemoteCall(false, "main/0_20_5.json").lookupRemoteVersion(v -> {
+        sourceWithMockedRemoteCall(false, ContentType.APPLICATION_JSON, "main/0_20_5.json").lookupRemoteVersion(v -> {
             assertEquals(Version.fromString("0.20.5"), v);
             called.set(true);
         });
         assertTrue(called.get());
         called.set(false);
-        sourceWithMockedRemoteCall(false, "main/0_90_13.json").lookupRemoteVersion(v -> {
+        sourceWithMockedRemoteCall(false, ContentType.APPLICATION_JSON, "main/0_90_13.json").lookupRemoteVersion(v -> {
             assertEquals(Version.fromString("0.90.13"), v);
             called.set(true);
         });
         assertTrue(called.get());
         called.set(false);
-        sourceWithMockedRemoteCall(false, "main/1_7_5.json").lookupRemoteVersion(v -> {
+        sourceWithMockedRemoteCall(false, ContentType.APPLICATION_JSON, "main/1_7_5.json").lookupRemoteVersion(v -> {
             assertEquals(Version.fromString("1.7.5"), v);
             called.set(true);
         });
         assertTrue(called.get());
         called.set(false);
-        sourceWithMockedRemoteCall(false, "main/2_3_3.json").lookupRemoteVersion(v -> {
+        sourceWithMockedRemoteCall(false, ContentType.APPLICATION_JSON, "main/2_3_3.json").lookupRemoteVersion(v -> {
             assertEquals(Version.V_2_3_3, v);
             called.set(true);
         });
         assertTrue(called.get());
         called.set(false);
-        sourceWithMockedRemoteCall(false, "main/5_0_0_alpha_3.json").lookupRemoteVersion(v -> {
+        sourceWithMockedRemoteCall(false, ContentType.APPLICATION_JSON, "main/5_0_0_alpha_3.json").lookupRemoteVersion(v -> {
             assertEquals(Version.V_5_0_0_alpha3, v);
             called.set(true);
         });
         assertTrue(called.get());
         called.set(false);
-        sourceWithMockedRemoteCall(false, "main/with_unknown_fields.json").lookupRemoteVersion(v -> {
+        sourceWithMockedRemoteCall(false, ContentType.APPLICATION_JSON, "main/with_unknown_fields.json").lookupRemoteVersion(v -> {
             assertEquals(Version.V_5_0_0_alpha3, v);
             called.set(true);
         });
@@ -167,8 +170,6 @@ public class RemoteScrollableHitSourceTests extends ESTestCase {
             assertEquals("test", r.getHits().get(0).getType());
             assertEquals("AVToMiC250DjIiBO3yJ_", r.getHits().get(0).getId());
             assertEquals("{\"test\":\"test2\"}", r.getHits().get(0).getSource().utf8ToString());
-            assertNull(r.getHits().get(0).getTTL());
-            assertNull(r.getHits().get(0).getTimestamp());
             assertNull(r.getHits().get(0).getRouting());
             called.set(true);
         });
@@ -187,8 +188,6 @@ public class RemoteScrollableHitSourceTests extends ESTestCase {
             assertEquals("test", r.getHits().get(0).getType());
             assertEquals("AVToMiDL50DjIiBO3yKA", r.getHits().get(0).getId());
             assertEquals("{\"test\":\"test3\"}", r.getHits().get(0).getSource().utf8ToString());
-            assertNull(r.getHits().get(0).getTTL());
-            assertNull(r.getHits().get(0).getTimestamp());
             assertNull(r.getHits().get(0).getRouting());
             called.set(true);
         });
@@ -203,8 +202,6 @@ public class RemoteScrollableHitSourceTests extends ESTestCase {
         sourceWithMockedRemoteCall("scroll_fully_loaded.json").doStartNextScroll("", timeValueMillis(0), r -> {
             assertEquals("AVToMiDL50DjIiBO3yKA", r.getHits().get(0).getId());
             assertEquals("{\"test\":\"test3\"}", r.getHits().get(0).getSource().utf8ToString());
-            assertEquals((Long) 1234L, r.getHits().get(0).getTTL());
-            assertEquals((Long) 123444L, r.getHits().get(0).getTimestamp());
             assertEquals("testrouting", r.getHits().get(0).getRouting());
             assertEquals("testparent", r.getHits().get(0).getParent());
             called.set(true);
@@ -220,15 +217,12 @@ public class RemoteScrollableHitSourceTests extends ESTestCase {
         sourceWithMockedRemoteCall("scroll_fully_loaded_1_7.json").doStartNextScroll("", timeValueMillis(0), r -> {
             assertEquals("AVToMiDL50DjIiBO3yKA", r.getHits().get(0).getId());
             assertEquals("{\"test\":\"test3\"}", r.getHits().get(0).getSource().utf8ToString());
-            assertEquals((Long) 1234L, r.getHits().get(0).getTTL());
-            assertNull(r.getHits().get(0).getTimestamp()); // Not available from 1.7
             assertEquals("testrouting", r.getHits().get(0).getRouting());
             assertEquals("testparent", r.getHits().get(0).getParent());
             called.set(true);
         });
         assertTrue(called.get());
     }
-
 
     /**
      * Versions of Elasticsearch before 2.1.0 don't support sort:_doc and instead need to use search_type=scan. Scan doesn't return
@@ -246,8 +240,6 @@ public class RemoteScrollableHitSourceTests extends ESTestCase {
             assertEquals("test", r.getHits().get(0).getType());
             assertEquals("AVToMiDL50DjIiBO3yKA", r.getHits().get(0).getId());
             assertEquals("{\"test\":\"test3\"}", r.getHits().get(0).getSource().utf8ToString());
-            assertNull(r.getHits().get(0).getTTL());
-            assertNull(r.getHits().get(0).getTimestamp());
             assertNull(r.getHits().get(0).getRouting());
             called.set(true);
         });
@@ -439,16 +431,15 @@ public class RemoteScrollableHitSourceTests extends ESTestCase {
         CloseableHttpAsyncClient httpClient = mock(CloseableHttpAsyncClient.class);
         when(httpClient.<HttpResponse>execute(any(HttpAsyncRequestProducer.class), any(HttpAsyncResponseConsumer.class),
                 any(FutureCallback.class))).then(new Answer<Future<HttpResponse>>() {
-                    @Override
-                    public Future<HttpResponse> answer(InvocationOnMock invocationOnMock) throws Throwable {
-                        HeapBufferedAsyncResponseConsumer consumer = (HeapBufferedAsyncResponseConsumer) invocationOnMock.getArguments()[1];
-                        FutureCallback callback = (FutureCallback) invocationOnMock.getArguments()[2];
-
-                        assertEquals(new ByteSizeValue(200, ByteSizeUnit.MB).bytesAsInt(), consumer.getBufferLimit());
-                        callback.failed(tooLong);
-                        return null;
-                    }
-                });
+            @Override
+            public Future<HttpResponse> answer(InvocationOnMock invocationOnMock) throws Throwable {
+                HeapBufferedAsyncResponseConsumer consumer = (HeapBufferedAsyncResponseConsumer) invocationOnMock.getArguments()[1];
+                FutureCallback callback = (FutureCallback) invocationOnMock.getArguments()[2];
+                assertEquals(new ByteSizeValue(100, ByteSizeUnit.MB).bytesAsInt(), consumer.getBufferLimit());
+                callback.failed(tooLong);
+                return null;
+            }
+        });
         RemoteScrollableHitSource source = sourceWithMockedClient(true, httpClient);
 
         AtomicBoolean called = new AtomicBoolean();
@@ -466,8 +457,25 @@ public class RemoteScrollableHitSourceTests extends ESTestCase {
         assertFalse(called.get());
     }
 
+    public void testNoContentTypeIsError() throws Exception {
+        Exception e = expectThrows(RuntimeException.class, () ->
+                sourceWithMockedRemoteCall(false, null, "main/0_20_5.json").lookupRemoteVersion(null));
+        assertThat(e.getCause().getCause().getMessage(), containsString("Response didn't include Content-Type: body={"));
+    }
+
+    public void testInvalidJsonThinksRemoveIsNotES() throws IOException {
+        Exception e = expectThrows(RuntimeException.class, () -> sourceWithMockedRemoteCall("some_text.txt").doStart(null));
+        assertEquals("Error parsing the response, remote is likely not an Elasticsearch instance", e.getCause().getCause().getMessage());
+    }
+
+    public void testUnexpectedJsonThinksRemoveIsNotES() throws IOException {
+        // Use the response from a main action instead of a proper start response to generate a parse error
+        Exception e = expectThrows(RuntimeException.class, () -> sourceWithMockedRemoteCall("main/2_3_3.json").doStart(null));
+        assertEquals("Error parsing the response, remote is likely not an Elasticsearch instance", e.getCause().getCause().getMessage());
+    }
+
     private RemoteScrollableHitSource sourceWithMockedRemoteCall(String... paths) throws Exception {
-        return sourceWithMockedRemoteCall(true, paths);
+        return sourceWithMockedRemoteCall(true, ContentType.APPLICATION_JSON, paths);
     }
 
     /**
@@ -475,7 +483,8 @@ public class RemoteScrollableHitSourceTests extends ESTestCase {
      * synchronously rather than asynchronously.
      */
     @SuppressWarnings("unchecked")
-    private RemoteScrollableHitSource sourceWithMockedRemoteCall(boolean mockRemoteVersion, String... paths) throws Exception {
+    private RemoteScrollableHitSource sourceWithMockedRemoteCall(boolean mockRemoteVersion, ContentType contentType, String... paths)
+            throws Exception {
         URL[] resources = new URL[paths.length];
         for (int i = 0; i < paths.length; i++) {
             resources[i] = Thread.currentThread().getContextClassLoader().getResource("responses/" + paths[i].replace("fail:", ""));
@@ -512,8 +521,7 @@ public class RemoteScrollableHitSourceTests extends ESTestCase {
                 } else {
                     StatusLine statusLine = new BasicStatusLine(protocolVersion, 200, "");
                     HttpResponse httpResponse = new BasicHttpResponse(statusLine);
-                    httpResponse.setEntity(new InputStreamEntity(resource.openStream(),
-                            randomBoolean() ? ContentType.APPLICATION_JSON : null));
+                    httpResponse.setEntity(new InputStreamEntity(resource.openStream(), contentType));
                     futureCallback.completed(httpResponse);
                 }
                 return null;

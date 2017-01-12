@@ -39,10 +39,6 @@ buildscript {
   }
 }
 
-// this is common configuration for distributions, but we also add it here for the license check to use
-ext.dependencyFiles = project(':core').configurations.runtime.copyRecursive()
-
-
 /*****************************************************************************
  *                                  Modules                                  *
  *****************************************************************************/
@@ -83,7 +79,7 @@ project.rootProject.subprojects.findAll { it.path.startsWith(':modules:') }.each
   restTestExpansions['expected.modules.count'] += 1
 }
 
-// Integ tests work over the rest http layer, so we need a transport included with the integ test zip. 
+// Integ tests work over the rest http layer, so we need a transport included with the integ test zip.
 // All transport modules are included so that they may be randomized for testing
 task buildTransportModules(type: Sync) {
   into 'build/transport-modules'
@@ -108,6 +104,7 @@ subprojects {
   /*****************************************************************************
    *                            Rest test config                               *
    *****************************************************************************/
+  apply plugin: 'elasticsearch.standalone-rest-test'
   apply plugin: 'elasticsearch.rest-test'
   project.integTest {
     dependsOn project.assemble
@@ -120,7 +117,7 @@ subprojects {
       mustRunAfter ':distribution:integ-test-zip:integTest#stop'
     }
   }
-  
+
   processTestResources {
     inputs.properties(project(':distribution').restTestExpansions)
     MavenFilteringHack.filter(it, project(':distribution').restTestExpansions)
@@ -146,7 +143,7 @@ subprojects {
     libFiles = copySpec {
       into 'lib'
       from project(':core').jar
-      from project(':distribution').dependencyFiles
+      from project(':core').configurations.runtime
     }
 
     modulesFiles = copySpec {
@@ -436,19 +433,6 @@ configure(subprojects.findAll { ['deb', 'rpm'].contains(it.name) }) {
     suckUpEmptyDirectories('/var/lib', 'elasticsearch', 'elasticsearch', 0750)
     suckUpEmptyDirectories('/usr/share/elasticsearch', 'root', 'root', 0755)
   }
-}
-
-// TODO: dependency checks should really be when building the jar itself, which would remove the need
-// for this hackery and instead we can do this inside the BuildPlugin
-task dependencyLicenses(type: DependencyLicensesTask) {
-  dependsOn = [dependencyFiles]
-  dependencies = dependencyFiles
-  mapping from: /lucene-.*/, to: 'lucene'
-  mapping from: /jackson-.*/, to: 'jackson'
-}
-task check(group: 'Verification', description: 'Runs all checks.', dependsOn: dependencyLicenses) {} // dummy task!
-task updateShas(type: UpdateShasTask) {
-  parentTask = dependencyLicenses
 }
 
 task run(type: RunTask) {

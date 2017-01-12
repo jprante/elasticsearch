@@ -39,8 +39,6 @@ import org.elasticsearch.common.util.concurrent.AbstractRunnable;
 import org.elasticsearch.common.util.concurrent.EsRejectedExecutionException;
 import org.elasticsearch.index.mapper.ParentFieldMapper;
 import org.elasticsearch.index.mapper.RoutingFieldMapper;
-import org.elasticsearch.index.mapper.TTLFieldMapper;
-import org.elasticsearch.index.mapper.TimestampFieldMapper;
 import org.elasticsearch.search.SearchHit;
 import org.elasticsearch.search.SearchHitField;
 import org.elasticsearch.threadpool.ThreadPool;
@@ -81,18 +79,16 @@ public class ClientScrollableHitSource extends ScrollableHitSource {
 
     @Override
     protected void doStartNextScroll(String scrollId, TimeValue extraKeepAlive, Consumer<? super Response> onResponse) {
-        SearchScrollRequest request = new SearchScrollRequest();
-        // Add the wait time into the scroll timeout so it won't timeout while we wait for throttling
-        request.scrollId(scrollId).scroll(timeValueNanos(firstSearchRequest.scroll().keepAlive().nanos() + extraKeepAlive.nanos()));
-        searchWithRetry(listener -> client.searchScroll(request, listener), r -> consume(r, onResponse));
+        searchWithRetry(listener -> {
+            SearchScrollRequest request = new SearchScrollRequest();
+            // Add the wait time into the scroll timeout so it won't timeout while we wait for throttling
+            request.scrollId(scrollId).scroll(timeValueNanos(firstSearchRequest.scroll().keepAlive().nanos() + extraKeepAlive.nanos()));
+            client.searchScroll(request, listener);
+        }, r -> consume(r, onResponse));
     }
 
     @Override
-    public void clearScroll(String scrollId) {
-        /*
-         * Fire off the clear scroll but don't wait for it it return before
-         * we send the use their response.
-         */
+    public void clearScroll(String scrollId, Runnable onCompletion) {
         ClearScrollRequest clearScrollRequest = new ClearScrollRequest();
         clearScrollRequest.addScrollId(scrollId);
         /*
@@ -103,13 +99,20 @@ public class ClientScrollableHitSource extends ScrollableHitSource {
             @Override
             public void onResponse(ClearScrollResponse response) {
                 logger.debug("Freed [{}] contexts", response.getNumFreed());
+                onCompletion.run();
             }
 
             @Override
             public void onFailure(Exception e) {
                 logger.warn((Supplier<?>) () -> new ParameterizedMessage("Failed to clear scroll [{}]", scrollId), e);
+                onCompletion.run();
             }
         });
+    }
+
+    @Override
+    protected void cleanup() {
+        // Nothing to do
     }
 
     /**
@@ -128,6 +131,10 @@ public class ClientScrollableHitSource extends ScrollableHitSource {
          */
         class RetryHelper extends AbstractRunnable implements ActionListener<SearchResponse> {
             private final Iterator<TimeValue> retries = backoffPolicy.iterator();
+            /**
+             * The runnable to run that retries in the same context as the original call.
+             */
+            private Runnable retryWithContext;
             private volatile int retryCount = 0;
 
             @Override
@@ -148,7 +155,7 @@ public class ClientScrollableHitSource extends ScrollableHitSource {
                         TimeValue delay = retries.next();
                         logger.trace((Supplier<?>) () -> new ParameterizedMessage("retrying rejected search after [{}]", delay), e);
                         countSearchRetry.run();
-                        threadPool.schedule(delay, ThreadPool.Names.SAME, this);
+                        threadPool.schedule(delay, ThreadPool.Names.SAME, retryWithContext);
                     } else {
                         logger.warn(
                             (Supplier<?>) () -> new ParameterizedMessage(
@@ -161,7 +168,10 @@ public class ClientScrollableHitSource extends ScrollableHitSource {
                 }
             }
         }
-        new RetryHelper().run();
+        RetryHelper helper = new RetryHelper();
+        // Wrap the helper in a runnable that preserves the current context so we keep it on retry.
+        helper.retryWithContext = threadPool.getThreadContext().preserveContext(helper);
+        helper.run();
     }
 
     private void consume(SearchResponse response, Consumer<? super Response> onResponse) {
@@ -175,7 +185,7 @@ public class ClientScrollableHitSource extends ScrollableHitSource {
         } else {
             failures = new ArrayList<>(response.getShardFailures().length);
             for (ShardSearchFailure failure: response.getShardFailures()) {
-                String nodeId = failure.shard() == null ? null : failure.shard().nodeId();
+                String nodeId = failure.shard() == null ? null : failure.shard().getNodeId();
                 failures.add(new SearchFailure(failure.getCause(), failure.index(), failure.shardId(), nodeId));
             }
         }
@@ -197,9 +207,9 @@ public class ClientScrollableHitSource extends ScrollableHitSource {
         private final SearchHit delegate;
         private final BytesReference source;
 
-        public ClientHit(SearchHit delegate) {
+        ClientHit(SearchHit delegate) {
             this.delegate = delegate;
-            source = delegate.hasSource() ? null : delegate.getSourceRef();
+            source = delegate.hasSource() ? delegate.getSourceRef() : null;
         }
 
         @Override
@@ -235,16 +245,6 @@ public class ClientScrollableHitSource extends ScrollableHitSource {
         @Override
         public String getRouting() {
             return fieldValue(RoutingFieldMapper.NAME);
-        }
-
-        @Override
-        public Long getTimestamp() {
-            return fieldValue(TimestampFieldMapper.NAME);
-        }
-
-        @Override
-        public Long getTTL() {
-            return fieldValue(TTLFieldMapper.NAME);
         }
 
         private <T> T fieldValue(String fieldName) {

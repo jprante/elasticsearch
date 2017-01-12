@@ -25,6 +25,8 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.UnaryOperator;
 
 import org.elasticsearch.client.node.NodeClient;
 import org.elasticsearch.common.logging.DeprecationLogger;
@@ -44,40 +46,35 @@ public class RestControllerTests extends ESTestCase {
     public void testApplyRelevantHeaders() throws Exception {
         final ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
         Set<String> headers = new HashSet<>(Arrays.asList("header.1", "header.2"));
-        final RestController restController = new RestController(Settings.EMPTY, headers) {
-            @Override
-            boolean checkRequestParameters(RestRequest request, RestChannel channel) {
-                return true;
-            }
-
-            @Override
-            void executeHandler(RestRequest request, RestChannel channel, NodeClient client) throws Exception {
+        final RestController restController = new RestController(Settings.EMPTY, headers, null);
+        restController.registerHandler(RestRequest.Method.GET, "/",
+            (RestRequest request, RestChannel channel, NodeClient client) -> {
                 assertEquals("true", threadContext.getHeader("header.1"));
                 assertEquals("true", threadContext.getHeader("header.2"));
                 assertNull(threadContext.getHeader("header.3"));
-            }
-        };
+            });
         threadContext.putHeader("header.3", "true");
         Map<String, String> restHeaders = new HashMap<>();
         restHeaders.put("header.1", "true");
         restHeaders.put("header.2", "true");
         restHeaders.put("header.3", "false");
-        restController.dispatchRequest(new FakeRestRequest.Builder().withHeaders(restHeaders).build(), null, null, threadContext);
+        restController.dispatchRequest(new FakeRestRequest.Builder(xContentRegistry()).withHeaders(restHeaders).build(), null, null,
+                threadContext);
         assertNull(threadContext.getHeader("header.1"));
         assertNull(threadContext.getHeader("header.2"));
         assertEquals("true", threadContext.getHeader("header.3"));
     }
 
     public void testCanTripCircuitBreaker() throws Exception {
-        RestController controller = new RestController(Settings.EMPTY, Collections.emptySet());
+        RestController controller = new RestController(Settings.EMPTY, Collections.emptySet(), null);
         // trip circuit breaker by default
         controller.registerHandler(RestRequest.Method.GET, "/trip", new FakeRestHandler(true));
         controller.registerHandler(RestRequest.Method.GET, "/do-not-trip", new FakeRestHandler(false));
 
-        assertTrue(controller.canTripCircuitBreaker(new FakeRestRequest.Builder().withPath("/trip").build()));
+        assertTrue(controller.canTripCircuitBreaker(new FakeRestRequest.Builder(xContentRegistry()).withPath("/trip").build()));
         // assume trip even on unknown paths
-        assertTrue(controller.canTripCircuitBreaker(new FakeRestRequest.Builder().withPath("/unknown-path").build()));
-        assertFalse(controller.canTripCircuitBreaker(new FakeRestRequest.Builder().withPath("/do-not-trip").build()));
+        assertTrue(controller.canTripCircuitBreaker(new FakeRestRequest.Builder(xContentRegistry()).withPath("/unknown-path").build()));
+        assertFalse(controller.canTripCircuitBreaker(new FakeRestRequest.Builder(xContentRegistry()).withPath("/do-not-trip").build()));
     }
 
     public void testRegisterAsDeprecatedHandler() {
@@ -117,6 +114,24 @@ public class RestControllerTests extends ESTestCase {
 
         verify(controller).registerHandler(method, path, handler);
         verify(controller).registerAsDeprecatedHandler(deprecatedMethod, deprecatedPath, handler, deprecationMessage, logger);
+    }
+
+    public void testRestHandlerWrapper() throws Exception {
+        AtomicBoolean handlerCalled = new AtomicBoolean(false);
+        AtomicBoolean wrapperCalled = new AtomicBoolean(false);
+        RestHandler handler = (RestRequest request, RestChannel channel, NodeClient client) -> {
+            handlerCalled.set(true);
+        };
+        UnaryOperator<RestHandler> wrapper = h -> {
+            assertSame(handler, h);
+            return (RestRequest request, RestChannel channel, NodeClient client) -> wrapperCalled.set(true);
+        };
+        final RestController restController = new RestController(Settings.EMPTY, Collections.emptySet(), wrapper);
+        restController.registerHandler(RestRequest.Method.GET, "/", handler);
+        final ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
+        restController.dispatchRequest(new FakeRestRequest.Builder(xContentRegistry()).build(), null, null, threadContext);
+        assertTrue(wrapperCalled.get());
+        assertFalse(handlerCalled.get());
     }
 
     /**

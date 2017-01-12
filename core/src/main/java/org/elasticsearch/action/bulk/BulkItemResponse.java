@@ -32,7 +32,7 @@ import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.io.stream.Streamable;
 import org.elasticsearch.common.io.stream.Writeable;
-import org.elasticsearch.common.xcontent.StatusToXContent;
+import org.elasticsearch.common.xcontent.StatusToXContentObject;
 import org.elasticsearch.common.xcontent.ToXContent;
 import org.elasticsearch.common.xcontent.XContentBuilder;
 import org.elasticsearch.rest.RestStatus;
@@ -43,7 +43,7 @@ import java.io.IOException;
  * Represents a single item response for an action executed as part of the bulk API. Holds the index/type/id
  * of the relevant action, and if it has failed or not (with the failure message incase it failed).
  */
-public class BulkItemResponse implements Streamable, StatusToXContent {
+public class BulkItemResponse implements Streamable, StatusToXContentObject {
 
     @Override
     public RestStatus status() {
@@ -52,9 +52,10 @@ public class BulkItemResponse implements Streamable, StatusToXContent {
 
     @Override
     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+        builder.startObject();
         builder.startObject(opType.getLowercase());
         if (failure == null) {
-            response.toXContent(builder, params);
+            response.innerToXContent(builder, params);
             builder.field(Fields.STATUS, response.status().getStatus());
         } else {
             builder.field(Fields._INDEX, failure.getIndex());
@@ -65,6 +66,7 @@ public class BulkItemResponse implements Streamable, StatusToXContent {
             ElasticsearchException.toXContent(builder, params, failure.getCause());
             builder.endObject();
         }
+        builder.endObject();
         builder.endObject();
         return builder;
     }
@@ -179,7 +181,7 @@ public class BulkItemResponse implements Streamable, StatusToXContent {
 
         @Override
         public String toString() {
-            return Strings.toString(this, true);
+            return Strings.toString(this);
         }
     }
 
@@ -302,7 +304,7 @@ public class BulkItemResponse implements Streamable, StatusToXContent {
     @Override
     public void readFrom(StreamInput in) throws IOException {
         id = in.readVInt();
-        if (in.getVersion().onOrAfter(Version.V_6_0_0_alpha1)) {
+        if (in.getVersion().onOrAfter(Version.V_6_0_0_alpha1_UNRELEASED)) {
             opType = OpType.fromId(in.readByte());
         } else {
             opType = OpType.fromString(in.readString());
@@ -328,7 +330,7 @@ public class BulkItemResponse implements Streamable, StatusToXContent {
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         out.writeVInt(id);
-        if (out.getVersion().onOrAfter(Version.V_6_0_0_alpha1)) {
+        if (out.getVersion().onOrAfter(Version.V_6_0_0_alpha1_UNRELEASED)) {
             out.writeByte(opType.getId());
         } else {
             out.writeString(opType.getLowercase());

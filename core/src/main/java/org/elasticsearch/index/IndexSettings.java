@@ -22,9 +22,7 @@ import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.MergePolicy;
 import org.elasticsearch.Version;
 import org.elasticsearch.cluster.metadata.IndexMetaData;
-import org.elasticsearch.common.ParseFieldMatcher;
 import org.elasticsearch.common.logging.Loggers;
-import org.elasticsearch.common.regex.Regex;
 import org.elasticsearch.common.settings.IndexScopedSettings;
 import org.elasticsearch.common.settings.Setting;
 import org.elasticsearch.common.settings.Setting.Property;
@@ -40,7 +38,6 @@ import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Function;
-import java.util.function.Predicate;
 
 /**
  * This class encapsulates all index level settings and handles settings updates.
@@ -107,6 +104,9 @@ public final class IndexSettings {
         Setting.byteSizeSetting("index.translog.flush_threshold_size", new ByteSizeValue(512, ByteSizeUnit.MB), Property.Dynamic,
             Property.IndexScope);
 
+    public static final Setting<TimeValue> INDEX_SEQ_NO_CHECKPOINT_SYNC_INTERVAL =
+        Setting.timeSetting("index.seq_no.checkpoint_sync_interval", new TimeValue(30, TimeUnit.SECONDS),
+            new TimeValue(-1, TimeUnit.MILLISECONDS), Property.Dynamic, Property.IndexScope);
 
     /**
      * Index setting to enable / disable deletes garbage collection.
@@ -135,7 +135,6 @@ public final class IndexSettings {
     private final Settings nodeSettings;
     private final int numberOfShards;
     private final boolean isShadowReplicaIndex;
-    private final ParseFieldMatcher parseFieldMatcher;
     // volatile fields are updated via #updateIndexMetaData(IndexMetaData) under lock
     private volatile Settings settings;
     private volatile IndexMetaData indexMetaData;
@@ -144,10 +143,10 @@ public final class IndexSettings {
     private final boolean queryStringAnalyzeWildcard;
     private final boolean queryStringAllowLeadingWildcard;
     private final boolean defaultAllowUnmappedFields;
-    private final Predicate<String> indexNameMatcher;
     private volatile Translog.Durability durability;
     private final TimeValue syncInterval;
     private volatile TimeValue refreshInterval;
+    private final TimeValue globalCheckpointInterval;
     private volatile ByteSizeValue flushThresholdSize;
     private final MergeSchedulerConfig mergeSchedulerConfig;
     private final MergePolicyConfig mergePolicyConfig;
@@ -210,7 +209,7 @@ public final class IndexSettings {
      * @param nodeSettings the nodes settings this index is allocated on.
      */
     public IndexSettings(final IndexMetaData indexMetaData, final Settings nodeSettings) {
-        this(indexMetaData, nodeSettings, (index) -> Regex.simpleMatch(index, indexMetaData.getIndex().getName()), IndexScopedSettings.DEFAULT_SCOPED_SETTINGS);
+        this(indexMetaData, nodeSettings, IndexScopedSettings.DEFAULT_SCOPED_SETTINGS);
     }
 
     /**
@@ -219,9 +218,8 @@ public final class IndexSettings {
      *
      * @param indexMetaData the index metadata this settings object is associated with
      * @param nodeSettings the nodes settings this index is allocated on.
-     * @param indexNameMatcher a matcher that can resolve an expression to the index name or index alias
      */
-    public IndexSettings(final IndexMetaData indexMetaData, final Settings nodeSettings, final Predicate<String> indexNameMatcher, IndexScopedSettings indexScopedSettings) {
+    public IndexSettings(final IndexMetaData indexMetaData, final Settings nodeSettings, IndexScopedSettings indexScopedSettings) {
         scopedSettings = indexScopedSettings.copy(nodeSettings, indexMetaData);
         this.nodeSettings = nodeSettings;
         this.settings = Settings.builder().put(nodeSettings).put(indexMetaData.getSettings()).build();
@@ -237,12 +235,11 @@ public final class IndexSettings {
         this.queryStringLenient = QUERY_STRING_LENIENT_SETTING.get(settings);
         this.queryStringAnalyzeWildcard = QUERY_STRING_ANALYZE_WILDCARD.get(nodeSettings);
         this.queryStringAllowLeadingWildcard = QUERY_STRING_ALLOW_LEADING_WILDCARD.get(nodeSettings);
-        this.parseFieldMatcher = new ParseFieldMatcher(settings);
         this.defaultAllowUnmappedFields = scopedSettings.get(ALLOW_UNMAPPED);
-        this.indexNameMatcher = indexNameMatcher;
         this.durability = scopedSettings.get(INDEX_TRANSLOG_DURABILITY_SETTING);
         syncInterval = INDEX_TRANSLOG_SYNC_INTERVAL_SETTING.get(settings);
         refreshInterval = scopedSettings.get(INDEX_REFRESH_INTERVAL_SETTING);
+        globalCheckpointInterval = scopedSettings.get(INDEX_SEQ_NO_CHECKPOINT_SYNC_INTERVAL);
         flushThresholdSize = scopedSettings.get(INDEX_TRANSLOG_FLUSH_THRESHOLD_SIZE_SETTING);
         mergeSchedulerConfig = new MergeSchedulerConfig(this);
         gcDeletesInMillis = scopedSettings.get(INDEX_GC_DELETES_SETTING).getMillis();
@@ -253,7 +250,6 @@ public final class IndexSettings {
         maxRefreshListeners = scopedSettings.get(MAX_REFRESH_LISTENERS_PER_SHARD);
         maxSlicesPerScroll = scopedSettings.get(MAX_SLICES_PER_SCROLL);
         this.mergePolicyConfig = new MergePolicyConfig(logger, this);
-        assert indexNameMatcher.test(indexMetaData.getIndex().getName());
 
         scopedSettings.addSettingsUpdateConsumer(MergePolicyConfig.INDEX_COMPOUND_FORMAT_SETTING, mergePolicyConfig::setNoCFSRatio);
         scopedSettings.addSettingsUpdateConsumer(MergePolicyConfig.INDEX_MERGE_POLICY_EXPUNGE_DELETES_ALLOWED_SETTING, mergePolicyConfig::setExpungeDeletesAllowed);
@@ -277,7 +273,6 @@ public final class IndexSettings {
         scopedSettings.addSettingsUpdateConsumer(INDEX_REFRESH_INTERVAL_SETTING, this::setRefreshInterval);
         scopedSettings.addSettingsUpdateConsumer(MAX_REFRESH_LISTENERS_PER_SHARD, this::setMaxRefreshListeners);
         scopedSettings.addSettingsUpdateConsumer(MAX_SLICES_PER_SCROLL, this::setMaxSlicesPerScroll);
-
     }
 
     private void setTranslogFlushThresholdSize(ByteSizeValue byteSizeValue) {
@@ -391,18 +386,6 @@ public final class IndexSettings {
     }
 
     /**
-     * Returns a {@link ParseFieldMatcher} for this index.
-     */
-    public ParseFieldMatcher getParseFieldMatcher() { return parseFieldMatcher; }
-
-    /**
-     * Returns <code>true</code> if the given expression matches the index name or one of it's aliases
-     */
-    public boolean matchesIndexName(String expression) {
-        return indexNameMatcher.test(expression);
-    }
-
-    /**
      * Updates the settings and index metadata and notifies all registered settings consumers with the new settings iff at least one setting has changed.
      *
      * @return <code>true</code> iff any setting has been updated otherwise <code>false</code>.
@@ -462,6 +445,13 @@ public final class IndexSettings {
      */
     public TimeValue getRefreshInterval() {
         return refreshInterval;
+    }
+
+    /**
+     * Returns this interval in which the primary shards of this index should check and advance the global checkpoint
+     */
+    public TimeValue getGlobalCheckpointInterval() {
+        return globalCheckpointInterval;
     }
 
     /**

@@ -21,6 +21,7 @@ package org.elasticsearch.gradle
 import nebula.plugin.extraconfigurations.ProvidedBasePlugin
 import org.elasticsearch.gradle.precommit.PrecommitTasks
 import org.gradle.api.GradleException
+import org.gradle.api.InvalidUserDataException
 import org.gradle.api.JavaVersion
 import org.gradle.api.Plugin
 import org.gradle.api.Project
@@ -54,6 +55,11 @@ class BuildPlugin implements Plugin<Project> {
 
     @Override
     void apply(Project project) {
+        if (project.pluginManager.hasPlugin('elasticsearch.standalone-rest-test')) {
+              throw new InvalidUserDataException('elasticsearch.standalone-test, '
+                + 'elasticearch.standalone-rest-test, and elasticsearch.build '
+                + 'are mutually exclusive')
+        }
         project.pluginManager.apply('java')
         project.pluginManager.apply('carrotsearch.randomized-testing')
         // these plugins add lots of info to our jars
@@ -490,6 +496,8 @@ class BuildPlugin implements Plugin<Project> {
             systemProperty 'tests.artifact', project.name
             systemProperty 'tests.task', path
             systemProperty 'tests.security.manager', 'true'
+            // Breaking change in JDK-9, revert to JDK-8 behavior for now, see https://github.com/elastic/elasticsearch/issues/21534
+            systemProperty 'jdk.io.permissionsUseCanonicalPath', 'true'
             systemProperty 'jna.nosys', 'true'
             // default test sysprop values
             systemProperty 'tests.ifNoTests', 'fail'
@@ -502,11 +510,9 @@ class BuildPlugin implements Plugin<Project> {
                 }
             }
 
-            // System assertions (-esa) are disabled for now because of what looks like a
-            // JDK bug triggered by Groovy on JDK7. We should look at re-enabling system
-            // assertions when we upgrade to a new version of Groovy (currently 2.4.4) or
-            // require JDK8. See https://issues.apache.org/jira/browse/GROOVY-7528.
-            enableSystemAssertions false
+            boolean assertionsEnabled = Boolean.parseBoolean(System.getProperty('tests.asserts', 'true'))
+            enableSystemAssertions assertionsEnabled
+            enableAssertions assertionsEnabled
 
             testLogging {
                 showNumFailuresAtEnd 25

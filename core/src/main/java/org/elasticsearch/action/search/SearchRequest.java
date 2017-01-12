@@ -24,11 +24,11 @@ import org.elasticsearch.action.ActionRequestValidationException;
 import org.elasticsearch.action.IndicesRequest;
 import org.elasticsearch.action.support.IndicesOptions;
 import org.elasticsearch.common.Nullable;
-import org.elasticsearch.common.ParseFieldMatcher;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.common.xcontent.ToXContent;
 import org.elasticsearch.search.Scroll;
 import org.elasticsearch.search.builder.SearchSourceBuilder;
 import org.elasticsearch.tasks.Task;
@@ -36,6 +36,7 @@ import org.elasticsearch.tasks.TaskId;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Objects;
 
 /**
@@ -45,11 +46,14 @@ import java.util.Objects;
  * Note, the search {@link #source(org.elasticsearch.search.builder.SearchSourceBuilder)}
  * is required. The search source is the different search options, including aggregations and such.
  * </p>
+ *
  * @see org.elasticsearch.client.Requests#searchRequest(String...)
  * @see org.elasticsearch.client.Client#search(SearchRequest)
  * @see SearchResponse
  */
-public final class SearchRequest extends ActionRequest<SearchRequest> implements IndicesRequest.Replaceable {
+public final class SearchRequest extends ActionRequest implements IndicesRequest.Replaceable {
+
+    private static final ToXContent.Params FORMAT_PARAMS = new ToXContent.MapParams(Collections.singletonMap("pretty", "false"));
 
     private SearchType searchType = SearchType.DEFAULT;
 
@@ -194,7 +198,7 @@ public final class SearchRequest extends ActionRequest<SearchRequest> implements
      * "query_then_fetch"/"queryThenFetch", and "query_and_fetch"/"queryAndFetch".
      */
     public SearchRequest searchType(String searchType) {
-        return searchType(SearchType.fromString(searchType, ParseFieldMatcher.EMPTY));
+        return searchType(SearchType.fromString(searchType));
     }
 
     /**
@@ -279,7 +283,26 @@ public final class SearchRequest extends ActionRequest<SearchRequest> implements
 
     @Override
     public Task createTask(long id, String type, String action, TaskId parentTaskId) {
-        return new SearchTask(id, type, action, getDescription(), parentTaskId);
+        // generating description in a lazy way since source can be quite big
+        return new SearchTask(id, type, action, null, parentTaskId) {
+            @Override
+            public String getDescription() {
+                StringBuilder sb = new StringBuilder();
+                sb.append("indices[");
+                Strings.arrayToDelimitedString(indices, ",", sb);
+                sb.append("], ");
+                sb.append("types[");
+                Strings.arrayToDelimitedString(types, ",", sb);
+                sb.append("], ");
+                sb.append("search_type[").append(searchType).append("], ");
+                if (source != null) {
+                    sb.append("source[").append(source.toString(FORMAT_PARAMS)).append("]");
+                } else {
+                    sb.append("source[]");
+                }
+                return sb.toString();
+            }
+        };
     }
 
     @Override

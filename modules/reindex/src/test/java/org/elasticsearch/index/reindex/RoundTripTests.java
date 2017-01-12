@@ -39,6 +39,7 @@ import org.elasticsearch.tasks.TaskId;
 import org.elasticsearch.test.ESTestCase;
 
 import java.io.IOException;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -46,7 +47,6 @@ import java.util.stream.IntStream;
 
 import static java.lang.Math.abs;
 import static java.util.Collections.emptyList;
-import static java.util.Collections.emptyMap;
 import static java.util.Collections.singletonList;
 import static java.util.stream.Collectors.toList;
 import static org.apache.lucene.util.TestUtil.randomSimpleString;
@@ -73,7 +73,10 @@ public class RoundTripTests extends ESTestCase {
             while (headers.size() < headersCount) {
                 headers.put(randomAsciiOfLength(5), randomAsciiOfLength(5));
             }
-            reindex.setRemoteInfo(new RemoteInfo(randomAsciiOfLength(5), randomAsciiOfLength(5), port, query, username, password, headers));
+            TimeValue socketTimeout = parseTimeValue(randomPositiveTimeValue(), "socketTimeout");
+            TimeValue connectTimeout = parseTimeValue(randomPositiveTimeValue(), "connectTimeout");
+            reindex.setRemoteInfo(new RemoteInfo(randomAsciiOfLength(5), randomAsciiOfLength(5), port, query, username, password, headers,
+                    socketTimeout, connectTimeout));
         }
         ReindexRequest tripped = new ReindexRequest();
         roundTrip(reindex, tripped);
@@ -81,15 +84,15 @@ public class RoundTripTests extends ESTestCase {
 
         // Try slices with a version that doesn't support slices. That should fail.
         reindex.setSlices(between(2, 1000));
-        Exception e = expectThrows(UnsupportedOperationException.class, () -> roundTrip(Version.V_5_0_0_rc1, reindex, null));
+        Exception e = expectThrows(IllegalArgumentException.class, () -> roundTrip(Version.V_5_0_0_rc1, reindex, null));
         assertEquals("Attempting to send sliced reindex-style request to a node that doesn't support it. "
-                + "Version is [5.0.0-rc1] but must be [5.1.0]", e.getMessage());
+                + "Version is [5.0.0-rc1] but must be [5.1.1]", e.getMessage());
 
         // Try without slices with a version that doesn't support slices. That should work.
         tripped = new ReindexRequest();
         reindex.setSlices(1);
         roundTrip(Version.V_5_0_0_rc1, reindex, tripped);
-        assertRequestEquals(reindex, tripped);
+        assertRequestEquals(Version.V_5_0_0_rc1, reindex, tripped);
     }
 
     public void testUpdateByQueryRequest() throws IOException {
@@ -105,9 +108,9 @@ public class RoundTripTests extends ESTestCase {
 
         // Try slices with a version that doesn't support slices. That should fail.
         update.setSlices(between(2, 1000));
-        Exception e = expectThrows(UnsupportedOperationException.class, () -> roundTrip(Version.V_5_0_0_rc1, update, null));
+        Exception e = expectThrows(IllegalArgumentException.class, () -> roundTrip(Version.V_5_0_0_rc1, update, null));
         assertEquals("Attempting to send sliced reindex-style request to a node that doesn't support it. "
-                + "Version is [5.0.0-rc1] but must be [5.1.0]", e.getMessage());
+                + "Version is [5.0.0-rc1] but must be [5.1.1]", e.getMessage());
 
         // Try without slices with a version that doesn't support slices. That should work.
         tripped = new UpdateByQueryRequest();
@@ -126,9 +129,9 @@ public class RoundTripTests extends ESTestCase {
 
         // Try slices with a version that doesn't support slices. That should fail.
         delete.setSlices(between(2, 1000));
-        Exception e = expectThrows(UnsupportedOperationException.class, () -> roundTrip(Version.V_5_0_0_rc1, delete, null));
+        Exception e = expectThrows(IllegalArgumentException.class, () -> roundTrip(Version.V_5_0_0_rc1, delete, null));
         assertEquals("Attempting to send sliced reindex-style request to a node that doesn't support it. "
-                + "Version is [5.0.0-rc1] but must be [5.1.0]", e.getMessage());
+                + "Version is [5.0.0-rc1] but must be [5.1.1]", e.getMessage());
 
         // Try without slices with a version that doesn't support slices. That should work.
         tripped = new DeleteByQueryRequest();
@@ -154,7 +157,7 @@ public class RoundTripTests extends ESTestCase {
         request.setScript(random().nextBoolean() ? null : randomScript());
     }
 
-    private void assertRequestEquals(ReindexRequest request, ReindexRequest tripped) {
+    private void assertRequestEquals(Version version, ReindexRequest request, ReindexRequest tripped) {
         assertRequestEquals((AbstractBulkIndexByScrollRequest<?>) request, (AbstractBulkIndexByScrollRequest<?>) tripped);
         assertEquals(request.getDestination().version(), tripped.getDestination().version());
         assertEquals(request.getDestination().index(), tripped.getDestination().index());
@@ -168,6 +171,13 @@ public class RoundTripTests extends ESTestCase {
             assertEquals(request.getRemoteInfo().getUsername(), tripped.getRemoteInfo().getUsername());
             assertEquals(request.getRemoteInfo().getPassword(), tripped.getRemoteInfo().getPassword());
             assertEquals(request.getRemoteInfo().getHeaders(), tripped.getRemoteInfo().getHeaders());
+            if (version.onOrAfter(Version.V_5_2_0_UNRELEASED)) {
+                assertEquals(request.getRemoteInfo().getSocketTimeout(), tripped.getRemoteInfo().getSocketTimeout());
+                assertEquals(request.getRemoteInfo().getConnectTimeout(), tripped.getRemoteInfo().getConnectTimeout());
+            } else {
+                assertEquals(RemoteInfo.DEFAULT_SOCKET_TIMEOUT, tripped.getRemoteInfo().getSocketTimeout());
+                assertEquals(RemoteInfo.DEFAULT_CONNECT_TIMEOUT, tripped.getRemoteInfo().getConnectTimeout());
+            }
         }
     }
 
@@ -207,7 +217,7 @@ public class RoundTripTests extends ESTestCase {
     }
 
     public void testReindexResponse() throws IOException {
-        BulkIndexByScrollResponse response = new BulkIndexByScrollResponse(timeValueMillis(randomPositiveLong()), randomStatus(),
+        BulkIndexByScrollResponse response = new BulkIndexByScrollResponse(timeValueMillis(randomNonNegativeLong()), randomStatus(),
                 randomIndexingFailures(), randomSearchFailures(), randomBoolean());
         BulkIndexByScrollResponse tripped = new BulkIndexByScrollResponse();
         roundTrip(response, tripped);
@@ -215,7 +225,7 @@ public class RoundTripTests extends ESTestCase {
     }
 
     public void testBulkIndexByScrollResponse() throws IOException {
-        BulkIndexByScrollResponse response = new BulkIndexByScrollResponse(timeValueMillis(randomPositiveLong()), randomStatus(),
+        BulkIndexByScrollResponse response = new BulkIndexByScrollResponse(timeValueMillis(randomNonNegativeLong()), randomStatus(),
                 randomIndexingFailures(), randomSearchFailures(), randomBoolean());
         BulkIndexByScrollResponse tripped = new BulkIndexByScrollResponse();
         roundTrip(response, tripped);
@@ -307,10 +317,12 @@ public class RoundTripTests extends ESTestCase {
     }
 
     private Script randomScript() {
-        return new Script(randomSimpleString(random()), // Name
-                randomFrom(ScriptType.values()), // Type
-                random().nextBoolean() ? null : randomSimpleString(random()), // Language
-                emptyMap()); // Params
+        ScriptType type = randomFrom(ScriptType.values());
+        String lang = random().nextBoolean() ? Script.DEFAULT_SCRIPT_LANG : randomSimpleString(random());
+        String idOrCode = randomSimpleString(random());
+        Map<String, Object> params = Collections.emptyMap();
+
+        return new Script(type, lang, idOrCode, params);
     }
 
     private void assertResponseEquals(BulkIndexByScrollResponse expected, BulkIndexByScrollResponse actual) {
@@ -353,7 +365,7 @@ public class RoundTripTests extends ESTestCase {
         assertEquals(expected.getRequestsPerSecond(), actual.getRequestsPerSecond(), 0f);
         assertEquals(expected.getReasonCancelled(), actual.getReasonCancelled());
         assertEquals(expected.getThrottledUntil(), actual.getThrottledUntil());
-        if (version.onOrAfter(BulkByScrollTask.V_5_1_0_UNRELEASED)) {
+        if (version.onOrAfter(Version.V_5_1_1_UNRELEASED)) {
             assertThat(actual.getSliceStatuses(), hasSize(expected.getSliceStatuses().size()));
             for (int i = 0; i < expected.getSliceStatuses().size(); i++) {
                 BulkByScrollTask.StatusOrException sliceStatus = expected.getSliceStatuses().get(i);

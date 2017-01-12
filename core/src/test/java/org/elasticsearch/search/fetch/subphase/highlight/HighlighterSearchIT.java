@@ -24,7 +24,6 @@ import org.elasticsearch.Version;
 import org.elasticsearch.action.index.IndexRequestBuilder;
 import org.elasticsearch.action.search.SearchRequestBuilder;
 import org.elasticsearch.action.search.SearchResponse;
-import org.elasticsearch.action.search.SearchType;
 import org.elasticsearch.action.support.WriteRequest;
 import org.elasticsearch.cluster.metadata.IndexMetaData;
 import org.elasticsearch.common.geo.GeoPoint;
@@ -40,8 +39,8 @@ import org.elasticsearch.index.query.Operator;
 import org.elasticsearch.index.query.QueryBuilder;
 import org.elasticsearch.index.query.QueryBuilders;
 import org.elasticsearch.index.query.functionscore.FunctionScoreQueryBuilder;
+import org.elasticsearch.index.query.functionscore.RandomScoreFunctionBuilder;
 import org.elasticsearch.index.search.MatchQuery;
-import org.elasticsearch.indices.IndicesRequestCache;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.rest.RestStatus;
 import org.elasticsearch.search.SearchHit;
@@ -104,6 +103,29 @@ public class HighlighterSearchIT extends ESIntegTestCase {
     @Override
     protected Collection<Class<? extends Plugin>> nodePlugins() {
         return Collections.singletonList(InternalSettingsPlugin.class);
+    }
+
+    public void testHighlightingWithStoredKeyword() throws IOException {
+        XContentBuilder mappings = jsonBuilder();
+        mappings.startObject();
+        mappings.startObject("type")
+            .startObject("properties")
+            .startObject("text")
+            .field("type", "keyword")
+            .field("store", true)
+            .endObject()
+            .endObject()
+            .endObject();
+        mappings.endObject();
+        assertAcked(prepareCreate("test")
+            .addMapping("type", mappings));
+        client().prepareIndex("test", "type", "1")
+            .setSource(jsonBuilder().startObject().field("text", "foo").endObject())
+            .get();
+        refresh();
+        SearchResponse search = client().prepareSearch().setQuery(matchQuery("text", "foo"))
+            .highlighter(new HighlightBuilder().field(new Field("text"))).get();
+        assertHighlight(search, 0, "text", 0, equalTo("<em>foo</em>"));
     }
 
     public void testHighlightingWithWildcardName() throws IOException {
@@ -677,7 +699,6 @@ public class HighlighterSearchIT extends ESIntegTestCase {
     }
 
     public void testPlainHighlighter() throws Exception {
-        createIndex("test");
         ensureGreen();
 
         client().prepareIndex("test", "type1")
@@ -693,49 +714,6 @@ public class HighlighterSearchIT extends ESIntegTestCase {
 
         assertHighlight(searchResponse, 0, "field1", 0, 1, equalTo("this is a <xxx>test</xxx>"));
 
-        logger.info("--> searching on _all, highlighting on field1");
-        source = searchSource()
-                .query(termQuery("_all", "test"))
-                .highlighter(highlight().field("field1").order("score").preTags("<xxx>").postTags("</xxx>").requireFieldMatch(false));
-
-        searchResponse = client().prepareSearch("test").setSource(source).get();
-
-        assertHighlight(searchResponse, 0, "field1", 0, 1, equalTo("this is a <xxx>test</xxx>"));
-
-        logger.info("--> searching on _all, highlighting on field2");
-        source = searchSource()
-                .query(termQuery("_all", "quick"))
-                .highlighter(highlight().field("field2").order("score").preTags("<xxx>").postTags("</xxx>").requireFieldMatch(false));
-
-        searchResponse = client().prepareSearch("test").setSource(source).get();
-
-        assertHighlight(searchResponse, 0, "field2", 0, 1, equalTo("The <xxx>quick</xxx> brown fox jumps over the lazy dog"));
-
-        logger.info("--> searching on _all, highlighting on field2");
-        source = searchSource()
-                .query(prefixQuery("_all", "qui"))
-                .highlighter(highlight().field("field2").order("score").preTags("<xxx>").postTags("</xxx>").requireFieldMatch(false));
-
-        searchResponse = client().prepareSearch("test").setSource(source).get();
-
-        assertHighlight(searchResponse, 0, "field2", 0, 1, equalTo("The <xxx>quick</xxx> brown fox jumps over the lazy dog"));
-
-        logger.info("--> searching on _all with constant score, highlighting on field2");
-        source = searchSource()
-                .query(constantScoreQuery(prefixQuery("_all", "qui")))
-                .highlighter(highlight().field("field2").order("score").preTags("<xxx>").postTags("</xxx>").requireFieldMatch(false));
-
-        searchResponse = client().prepareSearch("test").setSource(source).get();
-
-        assertHighlight(searchResponse, 0, "field2", 0, 1, equalTo("The <xxx>quick</xxx> brown fox jumps over the lazy dog"));
-
-        logger.info("--> searching on _all with constant score, highlighting on field2");
-        source = searchSource()
-                .query(boolQuery().should(constantScoreQuery(prefixQuery("_all", "qui"))))
-                .highlighter(highlight().field("field2").order("score").preTags("<xxx>").postTags("</xxx>").requireFieldMatch(false));
-
-        searchResponse = client().prepareSearch("test").setSource(source).get();
-        assertHighlight(searchResponse, 0, "field2", 0, 1, equalTo("The <xxx>quick</xxx> brown fox jumps over the lazy dog"));
     }
 
     public void testFastVectorHighlighter() throws Exception {
@@ -753,36 +731,6 @@ public class HighlighterSearchIT extends ESIntegTestCase {
         SearchResponse searchResponse = client().prepareSearch("test").setSource(source).get();
 
         assertHighlight(searchResponse, 0, "field1", 0, 1, equalTo("this is a <xxx>test</xxx>"));
-
-        logger.info("--> searching on _all, highlighting on field1");
-        source = searchSource()
-                .query(termQuery("_all", "test"))
-                .highlighter(highlight().field("field1", 100, 0).order("score").preTags("<xxx>").postTags("</xxx>")
-                        .requireFieldMatch(false));
-
-        searchResponse = client().prepareSearch("test").setSource(source).get();
-
-        assertHighlight(searchResponse, 0, "field1", 0, 1, equalTo("this is a <xxx>test</xxx>"));
-
-        logger.info("--> searching on _all, highlighting on field2");
-        source = searchSource()
-                .query(termQuery("_all", "quick"))
-                .highlighter(highlight().field("field2", 100, 0).order("score").preTags("<xxx>").postTags("</xxx>")
-                        .requireFieldMatch(false));
-
-        searchResponse = client().prepareSearch("test").setSource(source).get();
-
-        assertHighlight(searchResponse, 0, "field2", 0, 1, equalTo("The <xxx>quick</xxx> brown fox jumps over the lazy dog"));
-
-        logger.info("--> searching on _all, highlighting on field2");
-        source = searchSource()
-                .query(prefixQuery("_all", "qui"))
-                .highlighter(highlight().field("field2", 100, 0).order("score").preTags("<xxx>").postTags("</xxx>")
-                        .requireFieldMatch(false));
-
-        searchResponse = client().prepareSearch("test").setSource(source).get();
-
-        assertHighlight(searchResponse, 0, "field2", 0, 1, equalTo("The <xxx>quick</xxx> brown fox jumps over the lazy dog"));
 
         logger.info("--> searching with boundary characters");
         source = searchSource()
@@ -1029,22 +977,10 @@ public class HighlighterSearchIT extends ESIntegTestCase {
             // LUCENE 3.1 UPGRADE: Caused adding the space at the end...
             assertHighlight(searchResponse, i, "field1", 0, 1, equalTo("<em>test</em> " + hit.id()));
         }
-
-        logger.info("--> searching explicitly _all and highlighting on _all");
-        searchResponse = client().prepareSearch()
-                .setSize(COUNT)
-                .setQuery(termQuery("_all", "test"))
-                .highlighter(new HighlightBuilder().field("_all", 100, 0))
-                .get();
-        for (int i = 0; i < COUNT; i++) {
-            SearchHit hit = searchResponse.getHits().getHits()[i];
-            assertHighlight(searchResponse, i, "_all", 0, 1, equalTo("<em>test</em> " + hit.id()));
-        }
     }
 
     public XContentBuilder type1TermVectorMapping() throws IOException {
         return XContentFactory.jsonBuilder().startObject().startObject("type1")
-                .startObject("_all").field("store", true).field("term_vector", "with_positions_offsets").endObject()
                 .startObject("properties")
                 .startObject("field1").field("type", "text").field("term_vector", "with_positions_offsets").endObject()
                 .startObject("field2").field("type", "text").field("term_vector", "with_positions_offsets").endObject()
@@ -1469,7 +1405,7 @@ public class HighlighterSearchIT extends ESIntegTestCase {
                 .putArray("index.analysis.filter.synonym.synonyms", "quick => fast");
 
         assertAcked(prepareCreate("test").setSettings(builder.build()).addMapping("type1", type1TermVectorMapping())
-                .addMapping("type2", "_all", "store=true,term_vector=with_positions_offsets",
+                .addMapping("type2",
                         "field4", "type=text,term_vector=with_positions_offsets,analyzer=synonym",
                         "field3", "type=text,analyzer=synonym"));
         ensureGreen();
@@ -2067,7 +2003,7 @@ public class HighlighterSearchIT extends ESIntegTestCase {
         //lets fall back to the standard highlighter then, what people would do to highlight query matches
         logger.info("--> searching on field2, highlighting on field2, falling back to the plain highlighter");
         source = searchSource()
-                .query(matchPhraseQuery("_all", "quick brown"))
+                .query(matchPhraseQuery("field2", "quick brown"))
                 .highlighter(highlight()
                         .field("field2").preTags("<xxx>").postTags("</xxx>").highlighterType("plain").requireFieldMatch(false));
 
@@ -2152,7 +2088,6 @@ public class HighlighterSearchIT extends ESIntegTestCase {
     public void testMultiMatchQueryHighlight() throws IOException {
         String[] highlighterTypes = new String[] {"fvh", "plain", "postings"};
         XContentBuilder mapping = XContentFactory.jsonBuilder().startObject().startObject("type1")
-                .startObject("_all").field("store", true).field("index_options", "offsets").endObject()
                 .startObject("properties")
                     .startObject("field1")
                         .field("type", "text")
@@ -2768,15 +2703,12 @@ public class HighlighterSearchIT extends ESIntegTestCase {
         XContentBuilder mappings = jsonBuilder();
         mappings.startObject();
         mappings.startObject("jobs")
-            .startObject("_all")
-            .field("enabled", false)
-            .endObject()
             .startObject("properties")
             .startObject("loc")
             .field("type", "geo_point")
             .endObject()
             .startObject("jd")
-            .field("type", "string")
+            .field("type", "text")
             .endObject()
             .endObject()
             .endObject();
@@ -2829,35 +2761,6 @@ public class HighlighterSearchIT extends ESIntegTestCase {
                 equalTo("<em>some text</em>"));
     }
 
-    public void testStringFieldHighlighting() throws IOException {
-        // check that string field highlighting on old indexes works
-        XContentBuilder mappings = jsonBuilder();
-        mappings.startObject();
-        mappings.startObject("type")
-            .startObject("properties")
-            .startObject("string_field")
-            .field("type", "string")
-            .endObject()
-            .endObject()
-            .endObject();
-        mappings.endObject();
-        assertAcked(prepareCreate("test")
-            .addMapping("type", mappings)
-        .setSettings(Settings.builder().put(IndexMetaData.SETTING_VERSION_CREATED, Version.V_2_3_2)));
-
-        client().prepareIndex("test", "type", "1")
-            .setSource(jsonBuilder().startObject().field("string_field", "some text").endObject())
-            .get();
-        refresh();
-        SearchResponse search = client().prepareSearch().setSource(new SearchSourceBuilder()
-            .query(QueryBuilders.matchQuery("string_field", "some text"))
-            .highlighter(new HighlightBuilder().field("*"))).get();
-        assertNoFailures(search);
-        assertThat(search.getHits().totalHits(), equalTo(1L));
-        assertThat(search.getHits().getAt(0).getHighlightFields().get("string_field").getFragments()[0].string(),
-                equalTo("<em>some</em> <em>text</em>"));
-    }
-
     public void testACopyFieldWithNestedQuery() throws Exception {
         String mapping = jsonBuilder().startObject().startObject("type").startObject("properties")
                     .startObject("foo")
@@ -2905,6 +2808,26 @@ public class HighlighterSearchIT extends ESIntegTestCase {
 
         SearchResponse searchResponse = client().prepareSearch()
             .setQuery(new FunctionScoreQueryBuilder(QueryBuilders.prefixQuery("text", "bro")))
+            .highlighter(new HighlightBuilder()
+                .field(new Field("text")))
+            .get();
+        assertHitCount(searchResponse, 1);
+        HighlightField field = searchResponse.getHits().getAt(0).highlightFields().get("text");
+        assertThat(field.getFragments().length, equalTo(1));
+        assertThat(field.getFragments()[0].string(), equalTo("<em>brown</em>"));
+    }
+
+    public void testFiltersFunctionScoreQueryHighlight() throws Exception {
+        client().prepareIndex("test", "type", "1")
+            .setSource(jsonBuilder().startObject().field("text", "brown").field("enable", "yes").endObject())
+            .setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE)
+            .get();
+        FunctionScoreQueryBuilder.FilterFunctionBuilder filterBuilder =
+            new FunctionScoreQueryBuilder.FilterFunctionBuilder(QueryBuilders.termQuery("enable", "yes"),
+                new RandomScoreFunctionBuilder());
+        SearchResponse searchResponse = client().prepareSearch()
+            .setQuery(new FunctionScoreQueryBuilder(QueryBuilders.prefixQuery("text", "bro"),
+                new FunctionScoreQueryBuilder.FilterFunctionBuilder[] {filterBuilder}))
             .highlighter(new HighlightBuilder()
                 .field(new Field("text")))
             .get();

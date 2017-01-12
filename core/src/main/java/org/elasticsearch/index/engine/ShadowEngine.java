@@ -30,6 +30,7 @@ import org.elasticsearch.common.lucene.Lucene;
 import org.elasticsearch.common.lucene.index.ElasticsearchDirectoryReader;
 import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.common.util.concurrent.ReleasableLock;
+import org.elasticsearch.index.seqno.SequenceNumbersService;
 import org.elasticsearch.index.translog.Translog;
 
 import java.io.IOException;
@@ -113,6 +114,11 @@ public class ShadowEngine extends Engine {
     @Override
     public DeleteResult delete(Delete delete) {
         throw new UnsupportedOperationException(shardId + " delete operation not allowed on shadow engine");
+    }
+
+    @Override
+    public NoOpResult noOp(NoOp noOp) {
+        throw new UnsupportedOperationException(shardId + " no-op operation not allowed on shadow engine");
     }
 
     @Override
@@ -257,7 +263,23 @@ public class ShadowEngine extends Engine {
     }
 
     @Override
+    public SequenceNumbersService seqNoService() {
+        throw new UnsupportedOperationException("ShadowEngine doesn't track sequence numbers");
+    }
+
+    @Override
+    public boolean isThrottled() {
+        return false;
+    }
+
+    @Override
+    public long getIndexThrottleTimeInMillis() {
+        return 0L;
+    }
+
+    @Override
     public Engine recoverFromTranslog() throws IOException {
         throw new UnsupportedOperationException("can't recover on a shadow engine");
     }
+
 }

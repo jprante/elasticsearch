@@ -19,16 +19,6 @@
 
 package org.elasticsearch.index.query;
 
-import static java.util.Collections.unmodifiableMap;
-
-import java.io.IOException;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.function.Function;
-import java.util.function.LongSupplier;
-
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.queryparser.classic.MapperQueryParser;
@@ -39,11 +29,11 @@ import org.apache.lucene.search.similarities.Similarity;
 import org.apache.lucene.util.SetOnce;
 import org.elasticsearch.Version;
 import org.elasticsearch.client.Client;
-import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.common.ParsingException;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.lucene.search.Queries;
+import org.elasticsearch.common.xcontent.NamedXContentRegistry;
 import org.elasticsearch.index.Index;
 import org.elasticsearch.index.IndexSettings;
 import org.elasticsearch.index.analysis.IndexAnalyzers;
@@ -51,6 +41,7 @@ import org.elasticsearch.index.cache.bitset.BitsetFilterCache;
 import org.elasticsearch.index.fielddata.IndexFieldData;
 import org.elasticsearch.index.fielddata.IndexFieldDataService;
 import org.elasticsearch.index.mapper.ContentPath;
+import org.elasticsearch.index.mapper.DocumentMapper;
 import org.elasticsearch.index.mapper.MappedFieldType;
 import org.elasticsearch.index.mapper.Mapper;
 import org.elasticsearch.index.mapper.MapperService;
@@ -58,7 +49,6 @@ import org.elasticsearch.index.mapper.ObjectMapper;
 import org.elasticsearch.index.mapper.TextFieldMapper;
 import org.elasticsearch.index.query.support.NestedScope;
 import org.elasticsearch.index.similarity.SimilarityService;
-import org.elasticsearch.indices.query.IndicesQueriesRegistry;
 import org.elasticsearch.script.CompiledScript;
 import org.elasticsearch.script.ExecutableScript;
 import org.elasticsearch.script.Script;
@@ -66,6 +56,16 @@ import org.elasticsearch.script.ScriptContext;
 import org.elasticsearch.script.ScriptService;
 import org.elasticsearch.script.SearchScript;
 import org.elasticsearch.search.lookup.SearchLookup;
+
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.function.LongSupplier;
+
+import static java.util.Collections.unmodifiableMap;
 
 /**
  * Context object used to create lucene queries on the shard level.
@@ -92,17 +92,16 @@ public class QueryShardContext extends QueryRewriteContext {
 
     private final Map<String, Query> namedQueries = new HashMap<>();
     private final MapperQueryParser queryParser = new MapperQueryParser(this);
-    private final IndicesQueriesRegistry indicesQueriesRegistry;
     private boolean allowUnmappedFields;
     private boolean mapUnmappedFieldAsString;
     private NestedScope nestedScope;
     private boolean isFilter;
 
     public QueryShardContext(int shardId, IndexSettings indexSettings, BitsetFilterCache bitsetFilterCache,
-                             IndexFieldDataService indexFieldDataService, MapperService mapperService, SimilarityService similarityService,
-                             ScriptService scriptService, final IndicesQueriesRegistry indicesQueriesRegistry, Client client,
-                             IndexReader reader, ClusterState clusterState, LongSupplier nowInMillis) {
-        super(indexSettings, mapperService, scriptService, indicesQueriesRegistry, client, reader, clusterState, nowInMillis);
+            IndexFieldDataService indexFieldDataService, MapperService mapperService, SimilarityService similarityService,
+            ScriptService scriptService, NamedXContentRegistry xContentRegistry,
+            Client client, IndexReader reader, LongSupplier nowInMillis) {
+        super(indexSettings, mapperService, scriptService, xContentRegistry, client, reader, nowInMillis);
         this.shardId = shardId;
         this.indexSettings = indexSettings;
         this.similarityService = similarityService;
@@ -110,15 +109,14 @@ public class QueryShardContext extends QueryRewriteContext {
         this.bitsetFilterCache = bitsetFilterCache;
         this.indexFieldDataService = indexFieldDataService;
         this.allowUnmappedFields = indexSettings.isDefaultAllowUnmappedFields();
-        this.indicesQueriesRegistry = indicesQueriesRegistry;
         this.nestedScope = new NestedScope();
 
     }
 
     public QueryShardContext(QueryShardContext source) {
         this(source.shardId, source.indexSettings, source.bitsetFilterCache, source.indexFieldDataService, source.mapperService,
-                source.similarityService, source.scriptService, source.indicesQueriesRegistry, source.client,
-                source.reader, source.clusterState, source.nowInMillis);
+                source.similarityService, source.scriptService, source.getXContentRegistry(), source.client,
+                source.reader, source.nowInMillis);
         this.types = source.getTypes();
     }
 
@@ -211,6 +209,14 @@ public class QueryShardContext extends QueryRewriteContext {
     }
 
     /**
+     * Returns s {@link DocumentMapper} instance for the given type.
+     * Delegates to {@link MapperService#documentMapper(String)}
+     */
+    public DocumentMapper documentMapper(String type) {
+        return mapperService.documentMapper(type);
+    }
+
+    /**
      * Gets the search analyzer for the given field, or the default if there is none present for the field
      * TODO: remove this by moving defaults into mappers themselves
      */
@@ -282,15 +288,6 @@ public class QueryShardContext extends QueryRewriteContext {
         return indexSettings.getIndexVersionCreated();
     }
 
-    public boolean matchesIndices(String... indices) {
-        for (String index : indices) {
-            if (indexSettings.matchesIndexName(index)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     public ParsedQuery toFilter(QueryBuilder queryBuilder) {
         return toQuery(queryBuilder, q -> {
             Query filter = q.toFilter(this);
@@ -338,18 +335,17 @@ public class QueryShardContext extends QueryRewriteContext {
      * Compiles (or retrieves from cache) and binds the parameters to the
      * provided script
      */
-    public final SearchScript getSearchScript(Script script, ScriptContext context, Map<String, String> params) {
+    public final SearchScript getSearchScript(Script script, ScriptContext context) {
         failIfFrozen();
-        return scriptService.search(lookup(), script, context, params);
+        return scriptService.search(lookup(), script, context);
     }
     /**
      * Returns a lazily created {@link SearchScript} that is compiled immediately but can be pulled later once all
      * parameters are available.
      */
-    public final Function<Map<String, Object>, SearchScript> getLazySearchScript(Script script, ScriptContext context,
-            Map<String, String> params) {
+    public final Function<Map<String, Object>, SearchScript> getLazySearchScript(Script script, ScriptContext context) {
         failIfFrozen();
-        CompiledScript compile = scriptService.compile(script, context, params);
+        CompiledScript compile = scriptService.compile(script, context, script.getOptions());
         return (p) -> scriptService.search(lookup(), compile, p);
     }
 
@@ -357,19 +353,18 @@ public class QueryShardContext extends QueryRewriteContext {
      * Compiles (or retrieves from cache) and binds the parameters to the
      * provided script
      */
-    public final ExecutableScript getExecutableScript(Script script, ScriptContext context, Map<String, String> params) {
+    public final ExecutableScript getExecutableScript(Script script, ScriptContext context) {
         failIfFrozen();
-        return scriptService.executable(script, context, params);
+        return scriptService.executable(script, context);
     }
 
     /**
      * Returns a lazily created {@link ExecutableScript} that is compiled immediately but can be pulled later once all
      * parameters are available.
      */
-    public final Function<Map<String, Object>, ExecutableScript> getLazyExecutableScript(Script script, ScriptContext context,
-            Map<String, String> params) {
+    public final Function<Map<String, Object>, ExecutableScript> getLazyExecutableScript(Script script, ScriptContext context) {
         failIfFrozen();
-        CompiledScript executable = scriptService.compile(script, context, params);
+        CompiledScript executable = scriptService.compile(script, context, script.getOptions());
         return (p) ->  scriptService.executable(executable, p);
     }
 

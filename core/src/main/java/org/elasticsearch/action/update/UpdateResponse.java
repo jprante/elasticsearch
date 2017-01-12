@@ -24,6 +24,7 @@ import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.xcontent.XContentBuilder;
 import org.elasticsearch.index.get.GetResult;
+import org.elasticsearch.index.seqno.SequenceNumbersService;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.rest.RestStatus;
 
@@ -41,12 +42,11 @@ public class UpdateResponse extends DocWriteResponse {
      * For example: update script with operation set to none
      */
     public UpdateResponse(ShardId shardId, String type, String id, long version, Result result) {
-        this(new ShardInfo(0, 0), shardId, type, id, version, result);
+        this(new ShardInfo(0, 0), shardId, type, id, SequenceNumbersService.UNASSIGNED_SEQ_NO, version, result);
     }
 
-    public UpdateResponse(ShardInfo shardInfo, ShardId shardId, String type, String id,
-                          long version, Result result) {
-        super(shardId, type, id, version, result);
+    public UpdateResponse(ShardInfo shardInfo, ShardId shardId, String type, String id, long seqNo, long version, Result result) {
+        super(shardId, type, id, seqNo, version, result);
         setShardInfo(shardInfo);
     }
 
@@ -82,14 +82,13 @@ public class UpdateResponse extends DocWriteResponse {
         }
     }
 
-
     static final class Fields {
         static final String GET = "get";
     }
 
     @Override
-    public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
-        super.toXContent(builder, params);
+    public XContentBuilder innerToXContent(XContentBuilder builder, Params params) throws IOException {
+        super.innerToXContent(builder, params);
         if (getGetResult() != null) {
             builder.startObject(Fields.GET);
             getGetResult().toXContentEmbedded(builder, params);
@@ -110,5 +109,4 @@ public class UpdateResponse extends DocWriteResponse {
         builder.append(",shards=").append(getShardInfo());
         return builder.append("]").toString();
     }
-
 }

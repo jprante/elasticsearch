@@ -9,7 +9,7 @@ The latest stable version of Elasticsearch can be found on the
 link:/downloads/elasticsearch[Download Elasticsearch] page. Other versions can
 be found on the link:/downloads/past-releases[Past Releases page].
 
-NOTE: Elasticsearch requires Java 8 or later. Use the 
+NOTE: Elasticsearch requires Java 8 or later. Use the
 http://www.oracle.com/technetwork/java/javase/downloads/index.html[official Oracle distribution]
 or an open-source distribution such as http://openjdk.java.net[OpenJDK].
 
@@ -62,18 +62,23 @@ echo "deb https://artifacts.elastic.co/packages/{major-version}/apt stable main"
 endif::[]
 
 
-[WARNING]
+[NOTE]
 ==================================================
 
-Do not use `add-apt-repository` as it will add a `deb-src` entry as well, but
-we do not provide a source package. If you have added the `deb-src` entry, you
-will see an error like the following:
+These instructions do not use `add-apt-repository` for several reasons:
+
+. `add-apt-repository` adds entries to the system `/etc/apt/sources.list` file
+  rather than a clean per-repository file in `/etc/apt/sources.list.d`
+. `add-apt-repository` is not part of the default install on many distributions
+  and requires a number of non-default dependencies.
+. Older versions of `add-apt-repository` always add a `deb-src` entry which
+  will cause errors because we do not provide a source package. If you have added
+  the `deb-src` entry, you will see an error like the following until you delete
+  the `deb-src` line:
 
     Unable to find expected entry 'main/source/Sources' in Release file
     (Wrong sources.list entry or malformed file)
 
-Delete the `deb-src` entry from the `/etc/apt/sources.list` file and the
-installation should work as expected.
 ==================================================
 
 You can install the Elasticsearch Debian package with:
@@ -96,6 +101,7 @@ Examine +/etc/apt/sources.list.d/elasticsearch-{major-version}.list+ for the dup
 
 endif::[]
 
+include::skip-set-kernel-parameters.asciidoc[]
 
 [[install-deb]]
 ==== Download and install the Debian package manually
@@ -212,6 +218,7 @@ locations for a Debian-based system:
 | plugins
   | Plugin files location. Each plugin will be contained in a subdirectory.
   | /usr/share/elasticsearch/plugins
+  |
 
 | repo
   | Shared file system repository locations. Can hold multiple locations. A file system repository can be placed in to any subdirectory of any directory specified here.

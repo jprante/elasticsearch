@@ -33,17 +33,13 @@ import org.elasticsearch.cluster.node.DiscoveryNodes;
 import org.elasticsearch.cluster.routing.IndexShardRoutingTable;
 import org.elasticsearch.cluster.routing.ShardRouting;
 import org.elasticsearch.cluster.routing.ShardRoutingState;
-import org.elasticsearch.common.io.stream.StreamInput;
-import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
 import org.elasticsearch.common.util.set.Sets;
 import org.elasticsearch.index.shard.IndexShardNotStartedException;
 import org.elasticsearch.index.shard.IndexShardState;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.test.ESTestCase;
-import org.elasticsearch.transport.TransportResponse;
 
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -112,8 +108,9 @@ public class ReplicationOperationTests extends ESTestCase {
         PlainActionFuture<TestPrimary.Result> listener = new PlainActionFuture<>();
         final ClusterState finalState = state;
         final TestReplicaProxy replicasProxy = new TestReplicaProxy(expectedFailures);
+        final TestPrimary primary = new TestPrimary(primaryShard, primaryTerm);
         final TestReplicationOperation op = new TestReplicationOperation(request,
-            new TestPrimary(primaryShard, primaryTerm), listener, replicasProxy, () -> finalState);
+            primary, listener, replicasProxy, () -> finalState);
         op.execute();
 
         assertThat(request.primaryTerm(), equalTo(primaryTerm));
@@ -130,6 +127,9 @@ public class ReplicationOperationTests extends ESTestCase {
             indexShardRoutingTable.shardsWithState(ShardRoutingState.UNASSIGNED);
         final int totalShards = 1 + expectedReplicas.size() + unassignedShards.size();
         assertThat(shardInfo.getTotal(), equalTo(totalShards));
+
+        assertThat(primary.knownLocalCheckpoints.remove(primaryShard.allocationId().getId()), equalTo(primary.localCheckpoint));
+        assertThat(primary.knownLocalCheckpoints, equalTo(replicasProxy.generatedLocalCheckpoints));
     }
 
 
@@ -363,23 +363,21 @@ public class ReplicationOperationTests extends ESTestCase {
         }
 
         @Override
-        public void writeTo(StreamOutput out) throws IOException {
-            super.writeTo(out);
-        }
-
-        @Override
-        public void readFrom(StreamInput in) throws IOException {
-            super.readFrom(in);
+        public String toString() {
+            return "Request{}";
         }
     }
 
     static class TestPrimary implements ReplicationOperation.Primary<Request, Request, TestPrimary.Result> {
         final ShardRouting routing;
         final long term;
+        final long localCheckpoint;
+        final Map<String, Long> knownLocalCheckpoints = new HashMap<>();
 
         TestPrimary(ShardRouting routing, long term) {
             this.routing = routing;
             this.term = term;
+            this.localCheckpoint = random().nextLong();
         }
 
         @Override
@@ -423,6 +421,36 @@ public class ReplicationOperationTests extends ESTestCase {
                 return shardInfo;
             }
         }
+
+        @Override
+        public void updateLocalCheckpointForShard(String allocationId, long checkpoint) {
+            knownLocalCheckpoints.put(allocationId, checkpoint);
+        }
+
+        @Override
+        public long localCheckpoint() {
+            return localCheckpoint;
+        }
+    }
+
+    static class ReplicaResponse implements ReplicationOperation.ReplicaResponse {
+        final String allocationId;
+        final long localCheckpoint;
+
+        ReplicaResponse(String allocationId, long localCheckpoint) {
+            this.allocationId = allocationId;
+            this.localCheckpoint = localCheckpoint;
+        }
+
+        @Override
+        public long localCheckpoint() {
+            return localCheckpoint;
+        }
+
+        @Override
+        public String allocationId() {
+            return allocationId;
+        }
     }
 
     static class TestReplicaProxy implements ReplicationOperation.Replicas<Request> {
@@ -430,6 +458,8 @@ public class ReplicationOperationTests extends ESTestCase {
         final Map<ShardRouting, Exception> opFailures;
 
         final Set<ShardRouting> failedReplicas = ConcurrentCollections.newConcurrentSet();
+
+        final Map<String, Long> generatedLocalCheckpoints = ConcurrentCollections.newConcurrentMap();
 
         final Set<String> markedAsStaleCopies = ConcurrentCollections.newConcurrentSet();
 
@@ -442,12 +472,16 @@ public class ReplicationOperationTests extends ESTestCase {
         }
 
         @Override
-        public void performOn(ShardRouting replica, Request request, ActionListener<TransportResponse.Empty> listener) {
+        public void performOn(ShardRouting replica, Request request, ActionListener<ReplicationOperation.ReplicaResponse> listener) {
             assertTrue("replica request processed twice on [" + replica + "]", request.processedOnReplicas.add(replica));
             if (opFailures.containsKey(replica)) {
                 listener.onFailure(opFailures.get(replica));
             } else {
-                listener.onResponse(TransportResponse.Empty.INSTANCE);
+                final long checkpoint = random().nextLong();
+                final String allocationId = replica.allocationId().getId();
+                Long existing = generatedLocalCheckpoints.put(allocationId, checkpoint);
+                assertNull(existing);
+                listener.onResponse(new ReplicaResponse(allocationId, checkpoint));
             }
         }
 

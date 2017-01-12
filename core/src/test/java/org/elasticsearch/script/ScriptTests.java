@@ -19,13 +19,11 @@
 
 package org.elasticsearch.script;
 
-import org.elasticsearch.common.ParseFieldMatcher;
 import org.elasticsearch.common.io.stream.InputStreamStreamInput;
 import org.elasticsearch.common.io.stream.OutputStreamStreamOutput;
 import org.elasticsearch.common.xcontent.ToXContent;
 import org.elasticsearch.common.xcontent.XContent;
 import org.elasticsearch.common.xcontent.XContentBuilder;
-import org.elasticsearch.common.xcontent.XContentHelper;
 import org.elasticsearch.common.xcontent.XContentParser;
 import org.elasticsearch.common.xcontent.XContentType;
 import org.elasticsearch.test.ESTestCase;
@@ -45,8 +43,8 @@ public class ScriptTests extends ESTestCase {
         Script expectedScript = createScript(xContent);
         try (XContentBuilder builder = XContentBuilder.builder(xContent)) {
             expectedScript.toXContent(builder, ToXContent.EMPTY_PARAMS);
-            try (XContentParser parser = XContentHelper.createParser(builder.bytes())) {
-                Script actualScript = Script.parse(parser, ParseFieldMatcher.STRICT);
+            try (XContentParser parser = createParser(builder)) {
+                Script actualScript = Script.parse(parser);
                 assertThat(actualScript, equalTo(expectedScript));
             }
         }
@@ -65,7 +63,7 @@ public class ScriptTests extends ESTestCase {
     }
 
     private Script createScript(XContent xContent) throws IOException {
-        final Map<String, Object> params = randomBoolean() ? null : Collections.singletonMap("key", "value");
+        final Map<String, Object> params = randomBoolean() ? Collections.emptyMap() : Collections.singletonMap("key", "value");
         ScriptType scriptType = randomFrom(ScriptType.values());
         String script;
         if (scriptType == ScriptType.INLINE) {
@@ -79,11 +77,12 @@ public class ScriptTests extends ESTestCase {
             script = randomAsciiOfLengthBetween(1, 5);
         }
         return new Script(
-                script,
-                scriptType,
-                randomFrom("_lang1", "_lang2", null),
-                params,
-                scriptType == ScriptType.INLINE ? xContent.type() : null
+            scriptType,
+            randomFrom("_lang1", "_lang2", "_lang3"),
+            script,
+            scriptType == ScriptType.INLINE ?
+                Collections.singletonMap(Script.CONTENT_TYPE_OPTION, xContent.type().mediaType()) : Collections.emptyMap(),
+            params
         );
     }
 

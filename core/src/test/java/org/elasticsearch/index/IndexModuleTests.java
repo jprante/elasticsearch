@@ -57,14 +57,13 @@ import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.index.similarity.SimilarityProvider;
 import org.elasticsearch.index.similarity.SimilarityService;
 import org.elasticsearch.index.store.IndexStore;
-import org.elasticsearch.index.store.IndexStoreConfig;
 import org.elasticsearch.indices.IndicesModule;
 import org.elasticsearch.indices.IndicesQueryCache;
 import org.elasticsearch.indices.breaker.CircuitBreakerService;
 import org.elasticsearch.indices.breaker.NoneCircuitBreakerService;
+import org.elasticsearch.indices.cluster.IndicesClusterStateService.AllocatedIndices.IndexRemovalReason;
 import org.elasticsearch.indices.fielddata.cache.IndicesFieldDataCache;
 import org.elasticsearch.indices.mapper.MapperRegistry;
-import org.elasticsearch.indices.query.IndicesQueriesRegistry;
 import org.elasticsearch.script.ScriptContextRegistry;
 import org.elasticsearch.script.ScriptEngineRegistry;
 import org.elasticsearch.script.ScriptService;
@@ -110,7 +109,6 @@ public class IndexModuleTests extends ESTestCase {
     private CircuitBreakerService circuitBreakerService;
     private BigArrays bigArrays;
     private ScriptService scriptService;
-    private IndicesQueriesRegistry indicesQueriesRegistry;
     private ClusterService clusterService;
 
     @Override
@@ -130,7 +128,6 @@ public class IndexModuleTests extends ESTestCase {
         ScriptSettings scriptSettings = new ScriptSettings(scriptEngineRegistry, scriptContextRegistry);
         scriptService = new ScriptService(settings, environment, new ResourceWatcherService(settings, threadPool), scriptEngineRegistry,
                 scriptContextRegistry, scriptSettings);
-        indicesQueriesRegistry = new IndicesQueriesRegistry();
         clusterService = ClusterServiceUtils.createClusterService(threadPool);
         nodeEnvironment = new NodeEnvironment(settings, environment);
         mapperRegistry = new IndicesModule(Collections.emptyList()).getMapperRegistry();
@@ -144,16 +141,17 @@ public class IndexModuleTests extends ESTestCase {
     }
 
     private IndexService newIndexService(IndexModule module) throws IOException {
-        return module.newIndexService(nodeEnvironment, deleter, circuitBreakerService, bigArrays, threadPool, scriptService,
-                indicesQueriesRegistry, clusterService, null, indicesQueryCache, mapperRegistry,
+        return module.newIndexService(nodeEnvironment, xContentRegistry(), deleter, circuitBreakerService, bigArrays, threadPool,
+                scriptService, clusterService, null, indicesQueryCache, mapperRegistry, shardId -> {},
                 new IndicesFieldDataCache(settings, listener));
     }
 
     public void testWrapperIsBound() throws IOException {
-        IndexModule module = new IndexModule(indexSettings, null,
-                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap()));
+        IndexModule module = new IndexModule(indexSettings,
+                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyMap()));
         module.setSearcherWrapper((s) -> new Wrapper());
         module.engineFactory.set(new MockEngineFactory(AssertingDirectoryReader.class));
+
         IndexService indexService = newIndexService(module);
         assertTrue(indexService.getSearcherWrapper() instanceof Wrapper);
         assertSame(indexService.getEngineFactory(), module.engineFactory.get());
@@ -169,8 +167,8 @@ public class IndexModuleTests extends ESTestCase {
             .put(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), "foo_store")
             .build();
         IndexSettings indexSettings = IndexSettingsModule.newIndexSettings(index, settings);
-        IndexModule module = new IndexModule(indexSettings, null,
-                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap()));
+        IndexModule module = new IndexModule(indexSettings,
+                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyMap()));
         module.addIndexStore("foo_store", FooStore::new);
         try {
             module.addIndexStore("foo_store", FooStore::new);
@@ -178,6 +176,7 @@ public class IndexModuleTests extends ESTestCase {
         } catch (IllegalArgumentException ex) {
             // fine
         }
+
         IndexService indexService = newIndexService(module);
         assertTrue(indexService.getIndexStore() instanceof FooStore);
 
@@ -188,19 +187,19 @@ public class IndexModuleTests extends ESTestCase {
         final AtomicBoolean atomicBoolean = new AtomicBoolean(false);
         final IndexEventListener eventListener = new IndexEventListener() {
             @Override
-            public void beforeIndexDeleted(IndexService indexService) {
+            public void beforeIndexRemoved(IndexService indexService, IndexRemovalReason reason) {
                 atomicBoolean.set(true);
             }
         };
         IndexSettings indexSettings = IndexSettingsModule.newIndexSettings(index, settings);
-        IndexModule module = new IndexModule(indexSettings, null,
-                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap()));
+        IndexModule module = new IndexModule(indexSettings,
+                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyMap()));
         module.addIndexEventListener(eventListener);
         IndexService indexService = newIndexService(module);
         IndexSettings x = indexService.getIndexSettings();
         assertEquals(x.getSettings().getAsMap(), indexSettings.getSettings().getAsMap());
         assertEquals(x.getIndex(), index);
-        indexService.getIndexEventListener().beforeIndexDeleted(null);
+        indexService.getIndexEventListener().beforeIndexRemoved(null, null);
         assertTrue(atomicBoolean.get());
         indexService.close("simon says", false);
     }
@@ -208,8 +207,8 @@ public class IndexModuleTests extends ESTestCase {
 
     public void testListener() throws IOException {
         Setting<Boolean> booleanSetting = Setting.boolSetting("index.foo.bar", false, Property.Dynamic, Property.IndexScope);
-        IndexModule module = new IndexModule(IndexSettingsModule.newIndexSettings(index, settings, booleanSetting), null,
-                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap()));
+        IndexModule module = new IndexModule(IndexSettingsModule.newIndexSettings(index, settings, booleanSetting),
+                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyMap()));
         Setting<Boolean> booleanSetting2 = Setting.boolSetting("index.foo.bar.baz", false, Property.Dynamic, Property.IndexScope);
         AtomicBoolean atomicBoolean = new AtomicBoolean(false);
         module.addSettingsUpdateConsumer(booleanSetting, atomicBoolean::set);
@@ -228,8 +227,8 @@ public class IndexModuleTests extends ESTestCase {
     }
 
     public void testAddIndexOperationListener() throws IOException {
-        IndexModule module = new IndexModule(IndexSettingsModule.newIndexSettings(index, settings), null,
-                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap()));
+        IndexModule module = new IndexModule(IndexSettingsModule.newIndexSettings(index, settings),
+                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyMap()));
         AtomicBoolean executed = new AtomicBoolean(false);
         IndexingOperationListener listener = new IndexingOperationListener() {
             @Override
@@ -242,7 +241,6 @@ public class IndexModuleTests extends ESTestCase {
 
         expectThrows(IllegalArgumentException.class, () -> module.addIndexOperationListener(listener));
         expectThrows(IllegalArgumentException.class, () -> module.addIndexOperationListener(null));
-
 
         IndexService indexService = newIndexService(module);
         assertEquals(2, indexService.getIndexOperationListeners().size());
@@ -258,8 +256,8 @@ public class IndexModuleTests extends ESTestCase {
     }
 
     public void testAddSearchOperationListener() throws IOException {
-        IndexModule module = new IndexModule(IndexSettingsModule.newIndexSettings(index, settings), null,
-                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap()));
+        IndexModule module = new IndexModule(IndexSettingsModule.newIndexSettings(index, settings),
+                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyMap()));
         AtomicBoolean executed = new AtomicBoolean(false);
         SearchOperationListener listener = new SearchOperationListener() {
 
@@ -272,7 +270,6 @@ public class IndexModuleTests extends ESTestCase {
 
         expectThrows(IllegalArgumentException.class, () -> module.addSearchOperationListener(listener));
         expectThrows(IllegalArgumentException.class, () -> module.addSearchOperationListener(null));
-
 
         IndexService indexService = newIndexService(module);
         assertEquals(2, indexService.getSearchOperationListener().size());
@@ -293,8 +290,8 @@ public class IndexModuleTests extends ESTestCase {
                 .put("index.similarity.my_similarity.key", "there is a key")
                 .put(Environment.PATH_HOME_SETTING.getKey(), createTempDir().toString())
                 .build();
-        IndexModule module = new IndexModule(IndexSettingsModule.newIndexSettings("foo", indexSettings), null,
-                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap()));
+        IndexModule module = new IndexModule(IndexSettingsModule.newIndexSettings("foo", indexSettings),
+                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyMap()));
         module.addSimilarity("test_similarity", (string, settings) -> new SimilarityProvider() {
             @Override
             public String name() {
@@ -317,8 +314,8 @@ public class IndexModuleTests extends ESTestCase {
     }
 
     public void testFrozen() {
-        IndexModule module = new IndexModule(IndexSettingsModule.newIndexSettings(index, settings), null,
-                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap()));
+        IndexModule module = new IndexModule(IndexSettingsModule.newIndexSettings(index, settings),
+                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyMap()));
         module.freeze();
         String msg = "Can't modify IndexModule once the index service has been created";
         assertEquals(msg, expectThrows(IllegalStateException.class, () -> module.addSearchOperationListener(null)).getMessage());
@@ -336,8 +333,8 @@ public class IndexModuleTests extends ESTestCase {
                 .put(IndexMetaData.SETTING_VERSION_CREATED, Version.CURRENT)
                 .put(Environment.PATH_HOME_SETTING.getKey(), createTempDir().toString())
                 .build();
-        IndexModule module = new IndexModule(IndexSettingsModule.newIndexSettings("foo", indexSettings), null,
-                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap()));
+        IndexModule module = new IndexModule(IndexSettingsModule.newIndexSettings("foo", indexSettings),
+                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyMap()));
         Exception ex = expectThrows(IllegalArgumentException.class, () -> newIndexService(module));
         assertEquals("Unknown Similarity type [test_similarity] for [my_similarity]", ex.getMessage());
     }
@@ -348,8 +345,8 @@ public class IndexModuleTests extends ESTestCase {
                 .put(Environment.PATH_HOME_SETTING.getKey(), createTempDir().toString())
                 .put(IndexMetaData.SETTING_VERSION_CREATED, Version.CURRENT)
                 .build();
-        IndexModule module = new IndexModule(IndexSettingsModule.newIndexSettings("foo", indexSettings), null,
-                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap()));
+        IndexModule module = new IndexModule(IndexSettingsModule.newIndexSettings("foo", indexSettings),
+                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyMap()));
         Exception ex = expectThrows(IllegalArgumentException.class, () -> newIndexService(module));
         assertEquals("Similarity [my_similarity] must have an associated type", ex.getMessage());
     }
@@ -358,8 +355,8 @@ public class IndexModuleTests extends ESTestCase {
         Settings indexSettings = Settings.builder()
                 .put(Environment.PATH_HOME_SETTING.getKey(), createTempDir().toString())
                 .put(IndexMetaData.SETTING_VERSION_CREATED, Version.CURRENT).build();
-        IndexModule module = new IndexModule(IndexSettingsModule.newIndexSettings("foo", indexSettings), null,
-                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap()));
+        IndexModule module = new IndexModule(IndexSettingsModule.newIndexSettings("foo", indexSettings),
+                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyMap()));
         module.forceQueryCacheProvider((a, b) -> new CustomQueryCache());
         expectThrows(AlreadySetException.class, () -> module.forceQueryCacheProvider((a, b) -> new CustomQueryCache()));
         IndexService indexService = newIndexService(module);
@@ -371,8 +368,8 @@ public class IndexModuleTests extends ESTestCase {
         Settings indexSettings = Settings.builder()
                 .put(Environment.PATH_HOME_SETTING.getKey(), createTempDir().toString())
                 .put(IndexMetaData.SETTING_VERSION_CREATED, Version.CURRENT).build();
-        IndexModule module = new IndexModule(IndexSettingsModule.newIndexSettings("foo", indexSettings), null,
-                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap()));
+        IndexModule module = new IndexModule(IndexSettingsModule.newIndexSettings("foo", indexSettings),
+                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyMap()));
         IndexService indexService = newIndexService(module);
         assertTrue(indexService.cache().query() instanceof IndexQueryCache);
         indexService.close("simon says", false);
@@ -383,8 +380,8 @@ public class IndexModuleTests extends ESTestCase {
             .put(IndexModule.INDEX_QUERY_CACHE_ENABLED_SETTING.getKey(), false)
             .put(Environment.PATH_HOME_SETTING.getKey(), createTempDir().toString())
             .put(IndexMetaData.SETTING_VERSION_CREATED, Version.CURRENT).build();
-        IndexModule module = new IndexModule(IndexSettingsModule.newIndexSettings("foo", indexSettings), null,
-                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap()));
+        IndexModule module = new IndexModule(IndexSettingsModule.newIndexSettings("foo", indexSettings),
+                new AnalysisRegistry(environment, emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyMap()));
         module.forceQueryCacheProvider((a, b) -> new CustomQueryCache());
         IndexService indexService = newIndexService(module);
         assertTrue(indexService.cache().query() instanceof DisabledQueryCache);
@@ -442,8 +439,8 @@ public class IndexModuleTests extends ESTestCase {
 
     public static final class FooStore extends IndexStore {
 
-        public FooStore(IndexSettings indexSettings, IndexStoreConfig config) {
-            super(indexSettings, config);
+        public FooStore(IndexSettings indexSettings) {
+            super(indexSettings);
         }
     }
 

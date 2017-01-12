@@ -63,7 +63,7 @@ import org.elasticsearch.index.mapper.ParseContext.Document;
 import org.elasticsearch.index.mapper.ParsedDocument;
 import org.elasticsearch.index.mapper.Uid;
 import org.elasticsearch.index.merge.MergeStats;
-import org.elasticsearch.index.shard.DocsStats;
+import org.elasticsearch.index.seqno.SequenceNumbersService;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.index.store.Store;
 import org.elasticsearch.index.translog.Translog;
@@ -235,17 +235,13 @@ public abstract class Engine implements Closeable {
     /**
      * Returns the number of milliseconds this engine was under index throttling.
      */
-    public long getIndexThrottleTimeInMillis() {
-        return 0;
-    }
+    public abstract long getIndexThrottleTimeInMillis();
 
     /**
      * Returns the <code>true</code> iff this engine is currently under index throttling.
      * @see #getIndexThrottleTimeInMillis()
      */
-    public boolean isThrottled() {
-        return false;
-    }
+    public abstract boolean isThrottled();
 
     /** A Lock implementation that always allows the lock to be acquired */
     protected static final class NoOpLock implements Lock {
@@ -298,6 +294,8 @@ public abstract class Engine implements Closeable {
      */
     public abstract DeleteResult delete(final Delete delete);
 
+    public abstract NoOpResult noOp(final NoOp noOp);
+
     /**
      * Base class for index and delete operation results
      * Holds result meta data (e.g. translog location, updated version)
@@ -306,19 +304,21 @@ public abstract class Engine implements Closeable {
     public abstract static class Result {
         private final Operation.TYPE operationType;
         private final long version;
+        private final long seqNo;
         private final Exception failure;
         private final SetOnce<Boolean> freeze = new SetOnce<>();
         private Translog.Location translogLocation;
         private long took;
 
-        protected Result(Operation.TYPE operationType, Exception failure, long version) {
+        protected Result(Operation.TYPE operationType, Exception failure, long version, long seqNo) {
             this.operationType = operationType;
             this.failure = failure;
             this.version = version;
+            this.seqNo = seqNo;
         }
 
-        protected Result(Operation.TYPE operationType, long version) {
-            this(operationType, null, version);
+        protected Result(Operation.TYPE operationType, long version, long seqNo) {
+            this(operationType, null, version, seqNo);
         }
 
         /** whether the operation had failure */
@@ -329,6 +329,15 @@ public abstract class Engine implements Closeable {
         /** get the updated document version */
         public long getVersion() {
             return version;
+        }
+
+        /**
+         * Get the sequence number on the primary.
+         *
+         * @return the sequence number
+         */
+        public long getSeqNo() {
+            return seqNo;
         }
 
         /** get the translog location after executing the operation */
@@ -373,39 +382,55 @@ public abstract class Engine implements Closeable {
     }
 
     public static class IndexResult extends Result {
+
         private final boolean created;
 
-        public IndexResult(long version, boolean created) {
-            super(Operation.TYPE.INDEX, version);
+        public IndexResult(long version, long seqNo, boolean created) {
+            super(Operation.TYPE.INDEX, version, seqNo);
             this.created = created;
         }
 
-        public IndexResult(Exception failure, long version) {
-            super(Operation.TYPE.INDEX, failure, version);
+        public IndexResult(Exception failure, long version, long seqNo) {
+            super(Operation.TYPE.INDEX, failure, version, seqNo);
             this.created = false;
         }
 
         public boolean isCreated() {
             return created;
         }
+
     }
 
     public static class DeleteResult extends Result {
+
         private final boolean found;
 
-        public DeleteResult(long version, boolean found) {
-            super(Operation.TYPE.DELETE, version);
+        public DeleteResult(long version, long seqNo, boolean found) {
+            super(Operation.TYPE.DELETE, version, seqNo);
             this.found = found;
         }
 
-        public DeleteResult(Exception failure, long version) {
-            super(Operation.TYPE.DELETE, failure, version);
+        public DeleteResult(Exception failure, long version, long seqNo) {
+            super(Operation.TYPE.DELETE, failure, version, seqNo);
             this.found = false;
         }
 
         public boolean isFound() {
             return found;
         }
+
+    }
+
+    static class NoOpResult extends Result {
+
+        NoOpResult(long seqNo) {
+            super(Operation.TYPE.NO_OP, 0, seqNo);
+        }
+
+        NoOpResult(long seqNo, Exception failure) {
+            super(Operation.TYPE.NO_OP, failure, 0, seqNo);
+        }
+
     }
 
     /**
@@ -513,6 +538,9 @@ public abstract class Engine implements Closeable {
     public CommitStats commitStats() {
         return new CommitStats(getLastCommittedSegmentInfos());
     }
+
+    /** get the sequence number service */
+    public abstract SequenceNumbersService seqNoService();
 
     /**
      * Read the last segments info from the commit pointed to by the searcher manager
@@ -852,7 +880,8 @@ public abstract class Engine implements Closeable {
         /**
          * Called when a fatal exception occurred
          */
-        default void onFailedEngine(String reason, @Nullable Exception e) {}
+        default void onFailedEngine(String reason, @Nullable Exception e) {
+        }
     }
 
     public static class Searcher implements Releasable {
@@ -877,7 +906,7 @@ public abstract class Engine implements Closeable {
         }
 
         public DirectoryReader getDirectoryReader() {
-            if (reader() instanceof  DirectoryReader) {
+            if (reader() instanceof DirectoryReader) {
                 return (DirectoryReader) reader();
             }
             throw new IllegalStateException("Can't use " + reader().getClass() + " as a directory reader");
@@ -897,7 +926,7 @@ public abstract class Engine implements Closeable {
 
         /** type of operation (index, delete), subclasses use static types */
         public enum TYPE {
-            INDEX, DELETE;
+            INDEX, DELETE, NO_OP;
 
             private final String lowercase;
 
@@ -912,12 +941,16 @@ public abstract class Engine implements Closeable {
 
         private final Term uid;
         private final long version;
+        private final long seqNo;
+        private final long primaryTerm;
         private final VersionType versionType;
         private final Origin origin;
         private final long startTime;
 
-        public Operation(Term uid, long version, VersionType versionType, Origin origin, long startTime) {
+        public Operation(Term uid, long seqNo, long primaryTerm, long version, VersionType versionType, Origin origin, long startTime) {
             this.uid = uid;
+            this.seqNo = seqNo;
+            this.primaryTerm = primaryTerm;
             this.version = version;
             this.versionType = versionType;
             this.origin = origin;
@@ -947,6 +980,14 @@ public abstract class Engine implements Closeable {
             return this.version;
         }
 
+        public long seqNo() {
+            return seqNo;
+        }
+
+        public long primaryTerm() {
+            return primaryTerm;
+        }
+
         public abstract int estimatedSizeInBytes();
 
         public VersionType versionType() {
@@ -973,9 +1014,9 @@ public abstract class Engine implements Closeable {
         private final long autoGeneratedIdTimestamp;
         private final boolean isRetry;
 
-        public Index(Term uid, ParsedDocument doc, long version, VersionType versionType, Origin origin, long startTime,
-                     long autoGeneratedIdTimestamp, boolean isRetry) {
-            super(uid, version, versionType, origin, startTime);
+        public Index(Term uid, ParsedDocument doc, long seqNo, long primaryTerm, long version, VersionType versionType, Origin origin,
+                     long startTime, long autoGeneratedIdTimestamp, boolean isRetry) {
+            super(uid, seqNo, primaryTerm, version, versionType, origin, startTime);
             this.doc = doc;
             this.isRetry = isRetry;
             this.autoGeneratedIdTimestamp = autoGeneratedIdTimestamp;
@@ -986,7 +1027,8 @@ public abstract class Engine implements Closeable {
         } // TEST ONLY
 
         Index(Term uid, ParsedDocument doc, long version) {
-            this(uid, doc, version, VersionType.INTERNAL, Origin.PRIMARY, System.nanoTime(), -1, false);
+            this(uid, doc, SequenceNumbersService.UNASSIGNED_SEQ_NO, 0, version, VersionType.INTERNAL,
+                    Origin.PRIMARY, System.nanoTime(), -1, false);
         }
 
         public ParsedDocument parsedDoc() {
@@ -1010,14 +1052,6 @@ public abstract class Engine implements Closeable {
 
         public String routing() {
             return this.doc.routing();
-        }
-
-        public long timestamp() {
-            return this.doc.timestamp();
-        }
-
-        public long ttl() {
-            return this.doc.ttl();
         }
 
         public String parent() {
@@ -1061,18 +1095,20 @@ public abstract class Engine implements Closeable {
         private final String type;
         private final String id;
 
-        public Delete(String type, String id, Term uid, long version, VersionType versionType, Origin origin, long startTime) {
-            super(uid, version, versionType, origin, startTime);
+        public Delete(String type, String id, Term uid, long seqNo, long primaryTerm, long version, VersionType versionType,
+                      Origin origin, long startTime) {
+            super(uid, seqNo, primaryTerm, version, versionType, origin, startTime);
             this.type = type;
             this.id = id;
         }
 
         public Delete(String type, String id, Term uid) {
-            this(type, id, uid, Versions.MATCH_ANY, VersionType.INTERNAL, Origin.PRIMARY, System.nanoTime());
+            this(type, id, uid, SequenceNumbersService.UNASSIGNED_SEQ_NO, 0, Versions.MATCH_ANY, VersionType.INTERNAL, Origin.PRIMARY, System.nanoTime());
         }
 
         public Delete(Delete template, VersionType versionType) {
-            this(template.type(), template.id(), template.uid(), template.version(), versionType, template.origin(), template.startTime());
+            this(template.type(), template.id(), template.uid(), template.seqNo(), template.primaryTerm(), template.version(),
+                    versionType, template.origin(), template.startTime());
         }
 
         @Override
@@ -1094,6 +1130,50 @@ public abstract class Engine implements Closeable {
         public int estimatedSizeInBytes() {
             return (uid().field().length() + uid().text().length()) * 2 + 20;
         }
+
+    }
+
+    public static class NoOp extends Operation {
+
+        private final String reason;
+
+        public String reason() {
+            return reason;
+        }
+
+        public NoOp(
+            final Term uid,
+            final long seqNo,
+            final long primaryTerm,
+            final long version,
+            final VersionType versionType,
+            final Origin origin,
+            final long startTime,
+            final String reason) {
+            super(uid, seqNo, primaryTerm, version, versionType, origin, startTime);
+            this.reason = reason;
+        }
+
+        @Override
+        public String type() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        String id() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        TYPE operationType() {
+            return TYPE.NO_OP;
+        }
+
+        @Override
+        public int estimatedSizeInBytes() {
+            return 2 * reason.length() + 2 * Long.BYTES;
+        }
+
     }
 
     public static class Get {
@@ -1285,6 +1365,7 @@ public abstract class Engine implements Closeable {
      * Returns the timestamp of the last write in nanoseconds.
      * Note: this time might not be absolutely accurate since the {@link Operation#startTime()} is used which might be
      * slightly inaccurate.
+     *
      * @see System#nanoTime()
      * @see Operation#startTime()
      */
@@ -1293,17 +1374,8 @@ public abstract class Engine implements Closeable {
     }
 
     /**
-     * Returns the engines current document statistics
-     */
-    public DocsStats getDocStats() {
-        try (Engine.Searcher searcher = acquireSearcher("doc_stats")) {
-            IndexReader reader = searcher.reader();
-            return new DocsStats(reader.numDocs(), reader.numDeletedDocs());
-        }
-    }
-
-    /**
      * Called for each new opened engine searcher to warm new segments
+     *
      * @see EngineConfig#getWarmer()
      */
     public interface Warmer {

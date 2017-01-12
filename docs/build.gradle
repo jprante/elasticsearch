@@ -28,7 +28,6 @@ buildRestTests.expectedUnconvertedCandidates = [
   'reference/aggregations/bucket/daterange-aggregation.asciidoc',
   'reference/aggregations/bucket/diversified-sampler-aggregation.asciidoc',
   'reference/aggregations/bucket/filter-aggregation.asciidoc',
-  'reference/aggregations/bucket/filters-aggregation.asciidoc',
   'reference/aggregations/bucket/geodistance-aggregation.asciidoc',
   'reference/aggregations/bucket/geohashgrid-aggregation.asciidoc',
   'reference/aggregations/bucket/global-aggregation.asciidoc',
@@ -92,6 +91,7 @@ buildRestTests.expectedUnconvertedCandidates = [
   'reference/analysis/tokenfilters/stemmer-tokenfilter.asciidoc',
   'reference/analysis/tokenfilters/stop-tokenfilter.asciidoc',
   'reference/analysis/tokenfilters/synonym-tokenfilter.asciidoc',
+  'reference/analysis/tokenfilters/synonym-graph-tokenfilter.asciidoc',
   'reference/analysis/tokenfilters/word-delimiter-tokenfilter.asciidoc',
   'reference/cat/recovery.asciidoc',
   'reference/cat/shards.asciidoc',
@@ -156,7 +156,6 @@ buildRestTests.expectedUnconvertedCandidates = [
   'reference/search/request/inner-hits.asciidoc',
   'reference/search/request/rescore.asciidoc',
   'reference/search/search-template.asciidoc',
-  'reference/search/suggesters/completion-suggest.asciidoc',
 ]
 
 integTest {
@@ -172,6 +171,10 @@ integTest {
     }
     configFile 'scripts/my_script.js'
     configFile 'scripts/my_script.py'
+    configFile 'scripts/my_init_script.painless'
+    configFile 'scripts/my_map_script.painless'
+    configFile 'scripts/my_combine_script.painless'
+    configFile 'scripts/my_reduce_script.painless'
     configFile 'userdict_ja.txt'
     configFile 'KeywordTokenizer.rbbi'
     // Whitelist reindexing from the local node so we can test it.
@@ -250,6 +253,39 @@ buildRestTests.setups['host'] = '''
   - set: {nodes.$master.http.publish_address: host}
 '''
 
+// Used by scripted metric docs
+buildRestTests.setups['ledger'] = '''
+  - do:
+    indices.create:
+      index: ledger
+      body:
+        settings:
+          number_of_shards: 2
+          number_of_replicas: 1
+        mappings:
+          sale:
+            properties:
+              type:
+                type: keyword
+              amount:
+                type: double
+  - do:
+    bulk:
+      index: ledger
+      type: item
+      refresh: true
+      body: |
+        {"index":{}}
+        {"date": "2015/01/01 00:00:00", "amount": 200, "type": "sale", "description": "something"}
+        {"index":{}}
+        {"date": "2015/01/01 00:00:00", "amount": 10, "type": "expense", "decription": "another thing"}
+        {"index":{}}
+        {"date": "2015/01/01 00:00:00", "amount": 150, "type": "sale", "description": "blah"}
+        {"index":{}}
+        {"date": "2015/01/01 00:00:00", "amount": 50, "type": "expense", "description": "cost of blah"}
+        {"index":{}}
+        {"date": "2015/01/01 00:00:00", "amount": 50, "type": "expense", "description": "advertisement"}'''
+
 // Used by pipeline aggregation docs
 buildRestTests.setups['sales'] = '''
   - do:
@@ -307,3 +343,43 @@ buildRestTests.doFirst {
   buildRestTests.setups['bank'] =
     buildRestTests.setups['bank'].replace('#bank_data#', accounts)
 }
+
+buildRestTests.setups['range_index'] = '''
+  - do :
+    indices.create:
+      index: range_index
+      body:
+        settings:
+          number_of_shards: 2
+          number_of_replicas: 1
+        mappings:
+          my_type:
+            properties:
+              expected_attendees:
+                type: integer_range
+              time_frame:
+                type: date_range
+                format: yyyy-MM-dd HH:mm:ss||yyyy-MM-dd||epoch_millis
+  - do:
+    bulk:
+      index: range_index
+      type: my_type
+      refresh: true
+      body: |
+        {"index":{"_id": 1}}
+        {"expected_attendees": {"gte": 10, "lte": 20}, "time_frame": {"gte": "2015-10-31 12:00:00", "lte": "2015-11-01"}}'''
+
+// Used by index boost doc
+buildRestTests.setups['index_boost'] = '''
+  - do:
+      indices.create:
+          index:  index1
+  - do:
+      indices.create:
+          index:  index2
+
+  - do:
+      indices.put_alias:
+        index: index1
+        name: alias1
+'''

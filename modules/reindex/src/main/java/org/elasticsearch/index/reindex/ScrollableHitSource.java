@@ -83,13 +83,24 @@ public abstract class ScrollableHitSource implements Closeable {
     protected abstract void doStartNextScroll(String scrollId, TimeValue extraKeepAlive, Consumer<? super Response> onResponse);
     
     @Override
-    public void close() {
+    public final void close() {
         String scrollId = this.scrollId.get();
         if (Strings.hasLength(scrollId)) {
-            clearScroll(scrollId);
+            clearScroll(scrollId, this::cleanup);
+        } else {
+            cleanup();
         }
     }
-    protected abstract void clearScroll(String scrollId);
+    /**
+     * Called to clear a scroll id.
+     * @param scrollId the id to clear
+     * @param onCompletion implementers must call this after completing the clear whether they are successful or not
+     */
+    protected abstract void clearScroll(String scrollId, Runnable onCompletion);
+    /**
+     * Called after the process has been totally finished to clean up any resources the process needed like remote connections.
+     */
+    protected abstract void cleanup();
 
     /**
      * Set the id of the last scroll. Used for debugging.
@@ -187,14 +198,6 @@ public abstract class ScrollableHitSource implements Closeable {
          * The routing on the hit if there is any or null if there isn't.
          */
         @Nullable String getRouting();
-        /**
-         * The {@code _timestamp} on the hit if one was stored with the hit or null if one wasn't.
-         */
-        @Nullable Long getTimestamp();
-        /**
-         * The {@code _ttl} on the hit if one was set on it or null one wasn't.
-         */
-        @Nullable Long getTTL();
     }
 
     /**
@@ -210,8 +213,6 @@ public abstract class ScrollableHitSource implements Closeable {
         private BytesReference source;
         private String parent;
         private String routing;
-        private Long timestamp;
-        private Long ttl;
 
         public BasicHit(String index, String type, String id, long version) {
             this.index = index;
@@ -267,26 +268,6 @@ public abstract class ScrollableHitSource implements Closeable {
 
         public BasicHit setRouting(String routing) {
             this.routing = routing;
-            return this;
-        }
-
-        @Override
-        public Long getTimestamp() {
-            return timestamp;
-        }
-
-        public BasicHit setTimestamp(Long timestamp) {
-            this.timestamp = timestamp;
-            return this;
-        }
-
-        @Override
-        public Long getTTL() {
-            return ttl;
-        }
-
-        public BasicHit setTTL(Long ttl) {
-            this.ttl = ttl;
             return this;
         }
     }

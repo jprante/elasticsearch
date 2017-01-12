@@ -22,6 +22,7 @@ package org.elasticsearch.index.mapper;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.SortedNumericDocValuesField;
 import org.apache.lucene.index.IndexOptions;
+import org.apache.lucene.index.IndexableField;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TermRangeQuery;
 import org.apache.lucene.util.BytesRef;
@@ -152,16 +153,15 @@ public class BooleanFieldMapper extends FieldMapper {
             } else {
                 sValue = value.toString();
             }
-            if (sValue.length() == 0) {
-                return Values.FALSE;
+            switch (sValue) {
+                case "true":
+                    return Values.TRUE;
+                case "false":
+                    return Values.FALSE;
+                default:
+                    throw new IllegalArgumentException("Can't parse boolean value [" +
+                                    sValue + "], expected [true] or [false]");
             }
-            if (sValue.length() == 1 && sValue.charAt(0) == 'F') {
-                return Values.FALSE;
-            }
-            if (Booleans.parseBoolean(sValue, false)) {
-                return Values.TRUE;
-            }
-            return Values.FALSE;
         }
 
         @Override
@@ -218,7 +218,7 @@ public class BooleanFieldMapper extends FieldMapper {
     }
 
     @Override
-    protected void parseCreateField(ParseContext context, List<Field> fields) throws IOException {
+    protected void parseCreateField(ParseContext context, List<IndexableField> fields) throws IOException {
         if (fieldType().indexOptions() == IndexOptions.NONE && !fieldType().stored() && !fieldType().hasDocValues()) {
             return;
         }

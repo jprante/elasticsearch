@@ -93,6 +93,9 @@ class NodeInfo {
     /** buffer for ant output when starting this node */
     ByteArrayOutputStream buffer = new ByteArrayOutputStream()
 
+    /** the version of elasticsearch that this node runs */
+    String nodeVersion
+
     /** Creates a node to run as part of a cluster for the given task */
     NodeInfo(ClusterConfiguration config, int nodeNum, Project project, Task task, String nodeVersion, File sharedDir) {
         this.config = config
@@ -105,6 +108,7 @@ class NodeInfo {
         }
         baseDir = new File(project.buildDir, "cluster/${task.name} node${nodeNum}")
         pidFile = new File(baseDir, 'es.pid')
+        this.nodeVersion = nodeVersion
         homeDir = homeDir(baseDir, config.distribution, nodeVersion)
         confDir = confDir(baseDir, config.distribution, nodeVersion)
         if (config.dataDir != null) {
@@ -147,6 +151,9 @@ class NodeInfo {
         args.addAll("-E", "node.portsfile=true")
         String collectedSystemProperties = config.systemProperties.collect { key, value -> "-D${key}=${value}" }.join(" ")
         String esJavaOpts = config.jvmArgs.isEmpty() ? collectedSystemProperties : collectedSystemProperties + " " + config.jvmArgs
+        if (Boolean.parseBoolean(System.getProperty('tests.asserts', 'true'))) {
+            esJavaOpts += " -ea -esa"
+        }
         env.put('ES_JAVA_OPTS', esJavaOpts)
         for (Map.Entry<String, String> property : System.properties.entrySet()) {
             if (property.key.startsWith('tests.es.')) {

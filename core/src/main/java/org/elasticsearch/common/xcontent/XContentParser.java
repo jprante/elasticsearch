@@ -131,6 +131,10 @@ public interface XContentParser extends Releasable {
 
     Map<String, Object> mapOrdered() throws IOException;
 
+    Map<String, String> mapStrings() throws IOException;
+
+    Map<String, String> mapStringsOrdered() throws IOException;
+
     List<Object> list() throws IOException;
 
     List<Object> listOrderedMap() throws IOException;
@@ -244,6 +248,17 @@ public interface XContentParser extends Releasable {
      * @return last token's location or null if cannot be determined
      */
     XContentLocation getTokenLocation();
+
+    // TODO remove context entirely when it isn't needed
+    /**
+     * Parse an object by name.
+     */
+    <T> T namedObject(Class<T> categoryClass, String name, Object context) throws IOException;
+
+    /**
+     * The registry used to resolve {@link #namedObject(Class, String, Object)}. Use this when building a sub-parser from this parser.
+     */
+    NamedXContentRegistry getXContentRegistry();
 
     boolean isClosed();
 }

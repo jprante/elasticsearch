@@ -29,6 +29,7 @@ import org.elasticsearch.common.Nullable;
 import org.elasticsearch.common.lucene.all.AllEntries;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.xcontent.XContentParser;
+import org.elasticsearch.index.mapper.SeqNoFieldMapper;
 
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -254,6 +255,16 @@ public abstract class ParseContext {
         }
 
         @Override
+        public SeqNoFieldMapper.SequenceID seqID() {
+            return in.seqID();
+        }
+
+        @Override
+        public void seqID(SeqNoFieldMapper.SequenceID seqID) {
+            in.seqID(seqID);
+        }
+
+        @Override
         public AllEntries allEntries() {
             return in.allEntries();
         }
@@ -299,6 +310,8 @@ public abstract class ParseContext {
         private final SourceToParse sourceToParse;
 
         private Field version;
+
+        private SeqNoFieldMapper.SequenceID seqID;
 
         private final AllEntries allEntries;
 
@@ -389,6 +402,16 @@ public abstract class ParseContext {
         @Override
         public void version(Field version) {
             this.version = version;
+        }
+
+        @Override
+        public SeqNoFieldMapper.SequenceID seqID() {
+            return this.seqID;
+        }
+
+        @Override
+        public void seqID(SeqNoFieldMapper.SequenceID seqID) {
+            this.seqID = seqID;
         }
 
         @Override
@@ -516,6 +539,10 @@ public abstract class ParseContext {
     public abstract Field version();
 
     public abstract void version(Field version);
+
+    public abstract SeqNoFieldMapper.SequenceID seqID();
+
+    public abstract void seqID(SeqNoFieldMapper.SequenceID seqID);
 
     public final boolean includeInAll(Boolean includeInAll, FieldMapper mapper) {
         return includeInAll(includeInAll, mapper.fieldType().indexOptions() != IndexOptions.NONE);
